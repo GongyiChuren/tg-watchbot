@@ -308,6 +308,24 @@ bot:
       text: 你好，消息已收到，我稍后处理。
 ```
 
+TG 群关键词监听（可选，默认关闭）：
+
+```yaml
+group_monitors:
+  - name: TG 群关键词监听
+    enabled: false
+    chat_id: -1001234567890
+    keywords:
+      - VPS
+      - 优惠
+    exclude_keywords:
+      - 求带
+    notify_telegram: true
+```
+
+- 命中 `keywords` 且未命中 `exclude_keywords` 时，会给管理员发送摘要。
+- 机器人想收到群里普通消息，需要在 `@BotFather` 执行 `/setprivacy` 关闭隐私模式。
+
 监控数据自动清理示例：
 
 ```yaml

@@ -53,6 +53,16 @@ monitors:
     stock_change: false
   notify_telegram: true
   forum: true
+group_monitors:
+- name: TG 群关键词监听示例
+  enabled: false
+  chat_id: -1001234567890
+  keywords:
+  - VPS
+  - 优惠
+  exclude_keywords:
+  - 求带
+  notify_telegram: true
 cleanup:
   enabled: true
   interval_minutes: 60

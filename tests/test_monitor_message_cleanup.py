@@ -301,7 +301,7 @@ class PanelHtmlContractTest(unittest.TestCase):
 
     def test_layout_groups_navigation_by_domain(self) -> None:
         html = app.layout("测试", "<p>ok</p>")
-        for expected in ["<b>消息</b>", "<b>监控</b>", "<b>配置</b>", "<b>系统</b>", "私聊广告拦截"]:
+        for expected in ["<b>消息</b>", "<b>监控</b>", "<b>配置</b>", "<b>系统</b>", "私聊广告拦截", "TG 群监听"]:
             self.assertIn(expected, html)
 
     def test_inbox_copy_describes_two_way_conversation(self) -> None:
@@ -313,6 +313,19 @@ class PanelHtmlContractTest(unittest.TestCase):
         source = Path("app.py").read_text(encoding="utf-8")
         self.assertIn("action='/users/settings'", source)
         self.assertIn("这里和“Bot / 面板设置”共用同一份 .env", source)
+
+    def test_group_monitor_form_keeps_backend_field_names(self) -> None:
+        html = app.group_monitor_form_html()
+        for expected in [
+            "action='/group-monitors/create'",
+            "name=name",
+            "name=chat_id",
+            "name=keywords",
+            "name=exclude_keywords",
+            "name=enabled",
+            "name=notify_telegram",
+        ]:
+            self.assertIn(expected, html)
 
 
 class SpamAndTemplateConfigTest(unittest.TestCase):
@@ -345,6 +358,99 @@ class SpamAndTemplateConfigTest(unittest.TestCase):
             finally:
                 app.CONFIG_PATH = old_config_path
                 app.config = old_config
+
+
+class GroupMonitorTest(unittest.TestCase):
+    def test_group_monitor_for_chat_returns_enabled_target(self) -> None:
+        old_config = app.config
+        app.config = {
+            "group_monitors": [
+                {"enabled": True, "chat_id": -10001, "keywords": ["vps"], "exclude_keywords": []},
+                {"enabled": False, "chat_id": -10002, "keywords": ["api"]},
+            ]
+        }
+        try:
+            monitor = app.group_monitor_for_chat(-10001)
+            self.assertIsNotNone(monitor)
+            self.assertEqual(-10001, monitor["chat_id"])
+            self.assertIsNone(app.group_monitor_for_chat(-10002))
+        finally:
+            app.config = old_config
+
+    def test_handle_group_keyword_message_sends_summary_to_admin(self) -> None:
+        old_config = app.config
+        old_bot = app.bot
+        old_admin_chat_ids = app.admin_chat_ids
+        fake_bot = FakeBot()
+        app.bot = fake_bot
+        app.admin_chat_ids = [9001]
+        app.config = {
+            "group_monitors": [
+                {
+                    "enabled": True,
+                    "name": "测试群",
+                    "chat_id": -100100100,
+                    "keywords": ["vps", "优惠"],
+                    "exclude_keywords": ["求带"],
+                    "notify_telegram": True,
+                }
+            ]
+        }
+        msg = SimpleNamespace(
+            chat=SimpleNamespace(id=-100100100, username="groupdemo", title="测试群"),
+            from_user=SimpleNamespace(id=123, first_name="Alice", last_name="", username="alice"),
+            text="今晚 vps 有优惠",
+            caption=None,
+            reply_to_message=None,
+            message_id=777,
+            content_type="text",
+        )
+        try:
+            ok = asyncio.run(app.handle_group_keyword_message(msg))
+            self.assertTrue(ok)
+            self.assertEqual([9001], fake_bot.sent_chat_ids)
+            self.assertIn("[群关键词命中]", fake_bot.sent_texts[0])
+            self.assertIn("命中：vps, 优惠", fake_bot.sent_texts[0])
+        finally:
+            app.config = old_config
+            app.bot = old_bot
+            app.admin_chat_ids = old_admin_chat_ids
+
+    def test_handle_group_keyword_message_respects_exclude_keywords(self) -> None:
+        old_config = app.config
+        old_bot = app.bot
+        old_admin_chat_ids = app.admin_chat_ids
+        fake_bot = FakeBot()
+        app.bot = fake_bot
+        app.admin_chat_ids = [9001]
+        app.config = {
+            "group_monitors": [
+                {
+                    "enabled": True,
+                    "chat_id": -100100100,
+                    "keywords": ["vps"],
+                    "exclude_keywords": ["求带"],
+                    "notify_telegram": True,
+                }
+            ]
+        }
+        msg = SimpleNamespace(
+            chat=SimpleNamespace(id=-100100100, username="groupdemo", title="测试群"),
+            from_user=SimpleNamespace(id=123, first_name="Alice", last_name="", username="alice"),
+            text="vps 求带",
+            caption=None,
+            reply_to_message=None,
+            message_id=777,
+            content_type="text",
+        )
+        try:
+            ok = asyncio.run(app.handle_group_keyword_message(msg))
+            self.assertFalse(ok)
+            self.assertEqual([], fake_bot.sent_chat_ids)
+        finally:
+            app.config = old_config
+            app.bot = old_bot
+            app.admin_chat_ids = old_admin_chat_ids
 
 
 if __name__ == "__main__":

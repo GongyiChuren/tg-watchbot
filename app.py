@@ -27,6 +27,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from urllib.parse import quote_plus, urljoin
+import os.path as ospath
 
 import feedparser
 import httpx
@@ -79,6 +80,7 @@ pending_sendpic: dict[int, dict[str, Any]] = {}
 scheduler_ref: AsyncIOScheduler | None = None
 user_session_listener_task: asyncio.Task | None = None
 user_session_client: Any = None
+channel_media_clients: dict[str, Any] = {}
 GROUP_SUMMARY_MAX_CHARS = 800
 
 
@@ -230,11 +232,51 @@ def init_db() -> None:
                 last_seen_at TEXT NOT NULL,
                 active INTEGER DEFAULT 1
             );
+            CREATE TABLE IF NOT EXISTS channel_media_monitors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id INTEGER NOT NULL,
+                channel_title TEXT NOT NULL,
+                channel_username TEXT DEFAULT '',
+                status TEXT DEFAULT 'active',
+                media_types TEXT DEFAULT 'video,document',
+                keywords TEXT DEFAULT '',
+                max_file_size_mb INTEGER DEFAULT 2000,
+                download_dir TEXT DEFAULT '',
+                last_message_id INTEGER DEFAULT 0,
+                total_downloaded INTEGER DEFAULT 0,
+                total_size_bytes INTEGER DEFAULT 0,
+                notify_telegram INTEGER DEFAULT 1,
+                proxy TEXT DEFAULT '',
+                date_from TEXT DEFAULT '',
+                date_to TEXT DEFAULT '',
+                max_concurrent INTEGER DEFAULT 3,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS channel_media_downloads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                monitor_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                media_type TEXT NOT NULL,
+                file_name TEXT DEFAULT '',
+                file_path TEXT DEFAULT '',
+                file_size INTEGER DEFAULT 0,
+                caption TEXT DEFAULT '',
+                sender_id INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'completed',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (monitor_id) REFERENCES channel_media_monitors(id)
+            );
             """
         )
         for sql in [
             "ALTER TABLE inbox_messages ADD COLUMN direction TEXT DEFAULT 'in'",
             "ALTER TABLE inbox_messages ADD COLUMN source TEXT DEFAULT 'user'",
+            "ALTER TABLE channel_media_monitors ADD COLUMN proxy TEXT DEFAULT ''",
+            "ALTER TABLE channel_media_monitors ADD COLUMN date_from TEXT DEFAULT ''",
+            "ALTER TABLE channel_media_monitors ADD COLUMN date_to TEXT DEFAULT ''",
+            "ALTER TABLE channel_media_monitors ADD COLUMN max_concurrent INTEGER DEFAULT 3",
         ]:
             try:
                 conn.execute(sql)
@@ -536,6 +578,454 @@ def user_session_ready() -> bool:
     except Exception:
         return False
     return True
+
+
+# ---- Channel Media Download (Telethon user session) ----
+
+def get_or_create_channel_media_client(client_type: str = "channel_media", proxy: str = "") -> Any:
+    if TelegramClient is None or StringSession is None:
+        return None
+    if client_type in channel_media_clients:
+        c = channel_media_clients[client_type]
+        if c.is_connected():
+            return c
+    api_id, api_hash, session = user_session_config()
+    if not api_id or not api_hash or not session:
+        return None
+    try:
+        proxy_arg = None
+        if proxy and proxy.strip():
+            p = proxy.strip()
+            if p.startswith("socks5://") or p.startswith("socks4://"):
+                import socks
+                parts = p.replace("socks5://", "").replace("socks4://", "").split(":")
+                proxy_arg = (socks.SOCKS5 if "socks5" in p else socks.SOCKS4,
+                             parts[0], int(parts[1]) if len(parts) > 1 else 1080)
+            elif p.startswith("http://") or p.startswith("https://"):
+                proxy_arg = p
+            else:
+                proxy_arg = p
+        client = TelegramClient(StringSession(session), int(api_id), api_hash, proxy=proxy_arg)
+        channel_media_clients[client_type] = client
+        return client
+    except Exception:
+        logger.exception("failed to create channel media client")
+        return None
+
+
+async def disconnect_channel_media_client(client_type: str = "channel_media") -> None:
+    client = channel_media_clients.pop(client_type, None)
+    if client:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+
+def channel_media_monitors_all() -> list[dict[str, Any]]:
+    with closing(db()) as conn:
+        rows = conn.execute("SELECT * FROM channel_media_monitors ORDER BY id DESC").fetchall()
+    return [dict(r) for r in rows]
+
+
+def channel_media_monitor_get(monitor_id: int) -> dict[str, Any] | None:
+    with closing(db()) as conn:
+        row = conn.execute("SELECT * FROM channel_media_monitors WHERE id=?", (monitor_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def channel_media_monitor_create(
+    channel_id: int,
+    channel_title: str,
+    channel_username: str = "",
+    media_types: str = "video,document",
+    keywords: str = "",
+    max_file_size_mb: int = 2000,
+    download_dir: str = "",
+    notify_telegram: bool = True,
+    proxy: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    max_concurrent: int = 3,
+) -> int:
+    ts = now_iso()
+    with closing(db()) as conn:
+        cur = conn.execute(
+            """INSERT INTO channel_media_monitors
+            (channel_id, channel_title, channel_username, status, media_types, keywords,
+             max_file_size_mb, download_dir, notify_telegram, proxy, date_from, date_to,
+             max_concurrent, created_at, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (channel_id, channel_title, channel_username, "active", media_types, keywords,
+             max_file_size_mb, download_dir, 1 if notify_telegram else 0,
+             proxy, date_from, date_to, max_concurrent, ts, ts),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def channel_media_monitor_update(monitor_id: int, **kwargs: Any) -> None:
+    allowed = {"status", "media_types", "keywords", "max_file_size_mb", "download_dir",
+               "last_message_id", "notify_telegram", "total_downloaded", "total_size_bytes",
+               "proxy", "date_from", "date_to", "max_concurrent"}
+    updates = []
+    values = []
+    for k, v in kwargs.items():
+        if k in allowed:
+            updates.append(f"{k}=?")
+            values.append(v)
+    if not updates:
+        return
+    updates.append("updated_at=?")
+    values.append(now_iso())
+    values.append(monitor_id)
+    with closing(db()) as conn:
+        conn.execute(f"UPDATE channel_media_monitors SET {', '.join(updates)} WHERE id=?", values)
+        conn.commit()
+
+
+def channel_media_monitor_delete(monitor_id: int) -> None:
+    with closing(db()) as conn:
+        conn.execute("DELETE FROM channel_media_downloads WHERE monitor_id=?", (monitor_id,))
+        conn.execute("DELETE FROM channel_media_monitors WHERE id=?", (monitor_id,))
+        conn.commit()
+
+
+def channel_media_download_record(
+    monitor_id: int, channel_id: int, message_id: int,
+    media_type: str, file_name: str, file_path: str,
+    file_size: int, caption: str, sender_id: int, status: str = "completed",
+) -> int:
+    ts = now_iso()
+    with closing(db()) as conn:
+        cur = conn.execute(
+            """INSERT INTO channel_media_downloads
+            (monitor_id, channel_id, message_id, media_type, file_name, file_path,
+             file_size, caption, sender_id, status, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (monitor_id, channel_id, message_id, media_type, file_name, file_path,
+             file_size, caption, sender_id, status, ts),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def channel_media_downloads_list(monitor_id: int | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    with closing(db()) as conn:
+        if monitor_id:
+            rows = conn.execute(
+                "SELECT * FROM channel_media_downloads WHERE monitor_id=? ORDER BY id DESC LIMIT ?",
+                (monitor_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM channel_media_downloads ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def channel_media_download_exists(channel_id: int, message_id: int) -> bool:
+    with closing(db()) as conn:
+        row = conn.execute(
+            "SELECT id FROM channel_media_downloads WHERE channel_id=? AND message_id=?",
+            (channel_id, message_id),
+        ).fetchone()
+    return row is not None
+
+
+async def telethon_list_dialogs(limit: int = 500) -> list[dict[str, Any]]:
+    client = get_or_create_channel_media_client()
+    if not client:
+        return []
+    try:
+        if not client.is_connected():
+            await client.connect()
+        if not await client.is_user_authorized():
+            return []
+        result = []
+        count = 0
+        async for dialog in client.iter_dialogs(limit=limit):
+            entity = dialog.entity
+            chat_type = "unknown"
+            if dialog.is_group:
+                chat_type = "group"
+            elif dialog.is_channel:
+                chat_type = "channel"
+            elif dialog.is_user:
+                chat_type = "user"
+            result.append({
+                "id": dialog.id,
+                "title": dialog.name or "",
+                "username": getattr(entity, "username", "") or "",
+                "type": chat_type,
+                "unread_count": dialog.unread_count,
+            })
+            count += 1
+        logger.info("listed %d dialogs", count)
+        return result
+    except Exception:
+        logger.exception("telethon_list_dialogs failed")
+        return []
+
+
+async def telethon_search_dialogs(query: str, limit: int = 100) -> list[dict[str, Any]]:
+    client = get_or_create_channel_media_client()
+    if not client:
+        return []
+    try:
+        if not client.is_connected():
+            await client.connect()
+        if not await client.is_user_authorized():
+            return []
+        result = []
+        q = query.strip().lower()
+        async for dialog in client.iter_dialogs(limit=500):
+            name = (dialog.name or "").lower()
+            username = str(getattr(dialog.entity, "username", "") or "").lower()
+            if q in name or q in username or query.strip() in str(dialog.id):
+                entity = dialog.entity
+                chat_type = "group" if dialog.is_group else ("channel" if dialog.is_channel else ("user" if dialog.is_user else "unknown"))
+                result.append({
+                    "id": dialog.id,
+                    "title": dialog.name or "",
+                    "username": getattr(entity, "username", "") or "",
+                    "type": chat_type,
+                    "unread_count": dialog.unread_count,
+                })
+                if len(result) >= limit:
+                    break
+        return result
+    except Exception:
+        logger.exception("telethon_search_dialogs failed")
+        return []
+
+
+def _detect_media_type(media: Any, allowed_types: set[str]) -> str:
+    if not media:
+        return ""
+    if hasattr(media, "video") or hasattr(media, "document')"):
+        pass
+    from telethon.tl.types import (
+        DocumentAttributeVideo,
+        DocumentAttributeAudio,
+        DocumentAttributeFilename,
+    )
+    if hasattr(media, "photo"):
+        if "photo" not in allowed_types:
+            return ""
+        return "photo"
+    if hasattr(media, "document"):
+        doc = media.document
+        if doc is None:
+            return ""
+        mime = str(getattr(doc, "mime_type", "") or "")
+        for attr in (getattr(doc, "attributes", None) or []):
+            if isinstance(attr, DocumentAttributeVideo):
+                if "video" not in allowed_types:
+                    return ""
+                return "video"
+            if isinstance(attr, DocumentAttributeAudio):
+                if "audio" not in allowed_types:
+                    return ""
+                return "audio"
+        if mime.startswith("video/"):
+            if "video" not in allowed_types:
+                return ""
+            return "video"
+        if mime.startswith("audio/"):
+            if "audio" not in allowed_types:
+                return ""
+            return "audio"
+        if "document" in allowed_types:
+            return "document"
+        return ""
+    if "document" in allowed_types:
+        return "document"
+    return ""
+
+
+def _get_media_size(media: Any) -> int:
+    if hasattr(media, "document") and media.document:
+        return int(getattr(media.document, "size", 0) or 0)
+    if hasattr(media, "photo"):
+        return 0
+    return 0
+
+
+async def channel_media_monitor_loop() -> None:
+    while True:
+        await asyncio.sleep(300)
+        try:
+            monitors = channel_media_monitors_all()
+            active_monitors = [m for m in monitors if m.get("status") == "active"]
+            if not active_monitors:
+                continue
+            for monitor in active_monitors:
+                try:
+                    await telethon_download_from_channel(int(monitor["id"]))
+                except Exception:
+                    logger.exception("channel media monitor failed id=%s", monitor.get("id"))
+        except Exception:
+            logger.exception("channel_media_monitor_loop error")
+        finally:
+            await disconnect_channel_media_client()
+
+
+async def telethon_download_from_channel(monitor_id: int, download_history: bool = False) -> int:
+    monitor = channel_media_monitor_get(monitor_id)
+    if not monitor:
+        return 0
+    proxy = str(monitor.get("proxy") or "").strip()
+    client = get_or_create_channel_media_client(proxy=proxy)
+    if not client:
+        logger.warning("channel media client not available")
+        return 0
+    try:
+        if not client.is_connected():
+            await client.connect()
+        if not await client.is_user_authorized():
+            logger.warning("channel media client not authorized")
+            return 0
+        channel_id = int(monitor["channel_id"])
+        try:
+            entity = await client.get_entity(channel_id)
+        except Exception:
+            logger.warning("cannot resolve channel entity id=%s", channel_id)
+            return 0
+        media_types_str = str(monitor.get("media_types") or "video,document")
+        allowed_types = {t.strip().lower() for t in media_types_str.split(",") if t.strip()}
+        keywords_str = str(monitor.get("keywords") or "").strip()
+        keywords_list = [k.strip() for k in keywords_str.split(",") if k.strip()] if keywords_str else []
+        max_size = int(monitor.get("max_file_size_mb") or 2000) * 1024 * 1024
+        base_dir = str(monitor.get("download_dir") or "").strip()
+        if not base_dir:
+            base_dir = str(BASE_DIR / "channel_downloads" / str(channel_id))
+        os.makedirs(base_dir, exist_ok=True)
+        last_msg_id = int(monitor.get("last_message_id") or 0)
+        offset_id = last_msg_id if not download_history else 0
+
+        # Date filtering
+        from datetime import datetime as dt_type
+        offset_date = None
+        date_from_str = str(monitor.get("date_from") or "").strip()
+        date_to_str = str(monitor.get("date_to") or "").strip()
+        if date_from_str:
+            try:
+                offset_date = dt_type.fromisoformat(date_from_str)
+            except Exception:
+                pass
+        # Collect messages to download
+        messages_to_download = []
+        async for message in client.iter_messages(
+            entity, limit=500, offset_id=offset_id,
+            offset_date=offset_date, reverse=bool(offset_date),
+        ):
+            if offset_id > 0 and message.id <= offset_id and not offset_date:
+                break
+            # Date range check
+            if date_to_str and message.date:
+                try:
+                    dt_to = dt_type.fromisoformat(date_to_str)
+                    if message.date.replace(tzinfo=None) > dt_to:
+                        continue
+                except Exception:
+                    pass
+            if channel_media_download_exists(channel_id, message.id):
+                continue
+            if keywords_list:
+                msg_text = (message.text or "") + " " + (message.caption or "")
+                if not any(k.lower() in msg_text.lower() for k in keywords_list):
+                    continue
+            media = message.media
+            if not media:
+                continue
+            media_type = _detect_media_type(media, allowed_types)
+            if not media_type:
+                continue
+            file_size = _get_media_size(media)
+            if file_size and file_size > max_size:
+                continue
+            messages_to_download.append((message, media_type, file_size))
+
+        # Concurrent download with semaphore
+        max_concurrent = max(1, int(monitor.get("max_concurrent") or 3))
+        semaphore = asyncio.Semaphore(max_concurrent)
+        count = 0
+        total_size_added = 0
+
+        async def download_one(msg: Any, mt: str, fs: int) -> tuple[int, int]:
+            nonlocal count, total_size_added
+            async with semaphore:
+                caption = (msg.text or msg.caption or "")[:500]
+                sender_id = msg.sender_id or 0
+                file_name = ""
+                for attr in (getattr(getattr(msg.media, "document", None), "attributes", None) or []):
+                    if hasattr(attr, "file_name") and attr.file_name:
+                        file_name = attr.file_name
+                        break
+                if not file_name:
+                    file_name = f"{channel_id}_{msg.id}"
+                    ext_map = {"video": ".mp4", "photo": ".jpg", "audio": ".mp3", "document": ".bin"}
+                    file_name += ext_map.get(mt, ".bin")
+                file_path = ospath.join(base_dir, file_name)
+                if ospath.exists(file_path):
+                    file_path = ospath.join(base_dir, f"{channel_id}_{msg.id}_{file_name}")
+                # Resume: use .part file
+                part_path = file_path + ".part"
+                try:
+                    # Check for existing partial download
+                    existing_size = ospath.getsize(part_path) if ospath.exists(part_path) else 0
+                    if existing_size > 0 and fs and existing_size >= fs:
+                        # Already fully downloaded as .part, just rename
+                        os.rename(part_path, file_path)
+                    else:
+                        await client.download_media(msg, file=part_path)
+                        if ospath.exists(part_path):
+                            os.rename(part_path, file_path)
+                        else:
+                            return (0, 0)
+                    actual_size = ospath.getsize(file_path) if ospath.exists(file_path) else fs
+                    channel_media_download_record(
+                        monitor_id, channel_id, msg.id,
+                        mt, file_name, file_path,
+                        actual_size, caption, sender_id,
+                    )
+                    logger.info("downloaded channel media: channel=%s msg=%s type=%s", channel_id, msg.id, mt)
+                    return (1, actual_size)
+                except Exception:
+                    logger.exception("download failed channel=%s msg=%s", channel_id, msg.id)
+                    return (0, 0)
+
+        # Run all downloads concurrently
+        tasks = [download_one(msg, mt, fs) for msg, mt, fs in messages_to_download]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, tuple):
+                c, s = r
+                count += c
+                total_size_added += s
+
+        new_total = int(monitor.get("total_downloaded") or 0) + count
+        new_size = int(monitor.get("total_size_bytes") or 0) + total_size_added
+        update_kwargs: dict[str, Any] = {
+            "total_downloaded": new_total,
+            "total_size_bytes": new_size,
+        }
+        async for last_msg in client.iter_messages(entity, limit=1):
+            update_kwargs["last_message_id"] = last_msg.id
+            break
+        channel_media_monitor_update(monitor_id, **update_kwargs)
+        if count > 0 and monitor.get("notify_telegram"):
+            title = monitor.get("channel_title") or str(channel_id)
+            await admin_send(
+                f"[频道媒体下载] {html_escape(title)}\n"
+                f"新增 {count} 个文件，共 {total_size_added // 1024 // 1024} MB\n"
+                f"累计：{new_total} 个文件，{new_size // 1024 // 1024} MB"
+            )
+        return count
+    except Exception:
+        logger.exception("telethon_download_from_channel failed monitor_id=%s", monitor_id)
+        return 0
 
 
 def group_message_text(message: Message) -> str:
@@ -2259,7 +2749,7 @@ pre{{white-space:pre-wrap;background:#121212;color:#fff;padding:13px;border:4px 
 @media (prefers-reduced-motion: reduce){{
   *,*::before,*::after{{animation:none!important;transition:none!important}}
 }}
-</style></head><body><div class=shell><aside><div class=brand><div class=mark><i></i></div><div><b>tg-watchbot</b><small>Telegram 自动化</small></div></div><nav><section><b>消息</b><a href='/inbox'>收件箱</a><a href='/users'>用户管理</a><a href='/send'>主动发消息</a><a href='/replies'>快捷回复</a><a href='/rules'>私聊广告拦截</a></section><section><b>监控</b><a href='/'>监控面板</a><a href='/monitor/new'>新增监控</a><a href='/group-monitors'>TG 群监听</a><a href='/monitor/events'>推送历史</a><a href='/run-once'>手动检查</a></section><section><b>配置</b><a href='/settings'>Bot / 面板设置</a><a href='/yaml'>YAML 高级编辑</a><a href='/config/export'>导出配置</a></section><section><b>系统</b><a href='/update'>更新代码</a><a href='/logs'>运行日志</a><a href='/restart' onclick='return confirm("确定重启机器人服务？")'>重启机器人</a><a class=logout href='/logout'>退出登录</a></section></nav></aside><main><div class=top><h1>{html_escape(title)}</h1><span class=badge>WatchBot Panel</span></div>
+</style></head><body><div class=shell><aside><div class=brand><div class=mark><i></i></div><div><b>tg-watchbot</b><small>Telegram 自动化</small></div></div><nav><section><b>消息</b><a href='/inbox'>收件箱</a><a href='/users'>用户管理</a><a href='/send'>主动发消息</a><a href='/replies'>快捷回复</a><a href='/rules'>私聊广告拦截</a></section><section><b>监控</b><a href='/'>监控面板</a><a href='/monitor/new'>新增监控</a><a href='/group-monitors'>TG 群监听</a><a href='/channel-media'>频道媒体</a><a href='/monitor/events'>推送历史</a><a href='/run-once'>手动检查</a></section><section><b>配置</b><a href='/settings'>Bot / 面板设置</a><a href='/yaml'>YAML 高级编辑</a><a href='/config/export'>导出配置</a></section><section><b>系统</b><a href='/update'>更新代码</a><a href='/logs'>运行日志</a><a href='/restart' onclick='return confirm("确定重启机器人服务？")'>重启机器人</a><a class=logout href='/logout'>退出登录</a></section></nav></aside><main><div class=top><h1>{html_escape(title)}</h1><span class=badge>WatchBot Panel</span></div>
 {body}<div class=friend-links><b>友链</b><a href='https://linux.do' target='_blank' rel='noopener noreferrer'>Linux.do</a><span>·</span><a href='https://www.nodeseek.com' target='_blank' rel='noopener noreferrer'>NodeSeek</a></div></main></div></body></html>"""
 
 
@@ -3179,6 +3669,252 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
     async def health() -> str:
         return "ok"
 
+    # ---- Channel Media Monitoring Routes ----
+
+    def channel_media_page_html() -> str:
+        monitors = channel_media_monitors_all()
+        session_ok = user_session_ready()
+        notice = ""
+        if TelegramClient is None:
+            notice = "<div class=msg>未安装 telethon，频道媒体功能不可用。</div>"
+        elif not session_ok:
+            notice = "<div class=msg>TG_API_ID / TG_API_HASH / TG_API_SESSION 未完整填写，请先在「设置」中配置。</div>"
+        cards_html = ""
+        for m in monitors:
+            status = m.get("status", "active")
+            if status == "active":
+                badge_html = '<span class="badge" style="background:#22c55e">运行中</span>'
+            elif status == "paused":
+                badge_html = '<span class="badge" style="background:#eab308">已暂停</span>'
+            else:
+                badge_html = '<span class="badge" style="background:#6b7280">已停止</span>'
+            total = m.get("total_downloaded", 0)
+            size_mb = (m.get("total_size_bytes", 0) or 0) // 1024 // 1024
+            username = f"@{m.get('channel_username', '')}" if m.get("channel_username") else ""
+            pause_btn = ""
+            if status == "active":
+                pause_btn = f"<a class='btn' href='/channel-media/{m['id']}/pause'>暂停</a>"
+            elif status == "paused":
+                pause_btn = f"<a class='btn ok' href='/channel-media/{m['id']}/resume'>恢复</a>"
+            proxy_info = " · 代理: " + html_escape(m.get("proxy", "")) if m.get("proxy") else ""
+            date_info = ""
+            if m.get("date_from") or m.get("date_to"):
+                date_info = " · 日期: " + html_escape(m.get("date_from", "")) + "~" + html_escape(m.get("date_to", ""))
+            cards_html += f"""<div class=card style='margin:12px 0'>
+<div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px'>
+<div><h3 style='margin:0 0 4px'>{badge_html} {html_escape(m.get('channel_title',''))} {html_escape(username)}</h3>
+<small class=muted>chat_id: {m.get('channel_id','')} · 媒体类型: {html_escape(m.get('media_types',''))} · 并发: {m.get('max_concurrent',3)} · 已下载: {total} 个 · {size_mb} MB{proxy_info}{date_info}</small></div>
+<div class=actions>
+{pause_btn}
+<a class='btn ok' href='/channel-media/{m['id']}/download'>下载历史</a>
+<a class='btn' href='/channel-media/{m['id']}/check'>立即检查</a>
+<a class='btn danger' href='/channel-media/{m['id']}/delete' onclick='return confirm("确定删除该监控？")'>删除</a>
+</div></div></div>"""
+        return f"""<div class=card>
+<div class=toolbar><div><h2 style='margin:0 0 6px'>频道媒体监控</h2>
+<p class=muted style='margin:0'>使用你的 TG 账号监控频道/群组，自动下载媒体文件。</p></div>
+<div class=actions><button class='btn primary' onclick='document.getElementById("addModal").style.display="flex"'>添加频道/群组</button></div></div>
+{notice}{cards_html}</div>
+
+<div id='addModal' style='display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:100;justify-content:center;align-items:flex-start;padding-top:60px'>
+<div class=card style='max-width:640px;width:95%;max-height:80vh;overflow:auto;position:relative'>
+<h2>添加频道/群组监控</h2>
+<p class=muted>搜索并选择你已加入的频道或群组。</p>
+<div style='margin-bottom:16px'>
+<input id='groupSearch' placeholder='输入名称搜索...' oninput='filterGroups()' style='width:100%'>
+</div>
+<div id='groupList' style='max-height:300px;overflow:auto;border:3px solid var(--ink)'>
+<div id='groupLoading' class=muted style='padding:16px;text-align:center'>正在加载群组列表...</div>
+</div>
+<div id='selectedGroup' style='display:none;margin-top:12px;padding:12px;background:var(--gray);border:3px solid var(--ink)'>
+<b>已选择：</b> <span id='selectedName'></span>
+<input type=hidden id='selChannelId' name='channel_id'>
+<input type=hidden id='selChannelTitle' name='channel_title'>
+<input type=hidden id='selChannelUsername' name='channel_username'>
+</div>
+<div style='margin-top:14px'>
+<label>媒体类型（逗号分隔）</label>
+<input id='mediaTypes' value='video,document' placeholder='video,document,photo,audio'>
+<label>关键词过滤（逗号分隔，可留空）</label>
+<input id='mediaKeywords' placeholder='留空则下载所有'>
+<label>最大文件大小 (MB)</label>
+<input id='maxFileSize' type=number value=2000 min=1>
+<label>下载目录（留空使用默认）</label>
+<input id='downloadDir' placeholder='留空则使用默认目录'>
+<label>代理（留空不用，支持 socks5://host:port 或 http://host:port）</label>
+<input id='mediaProxy' placeholder='socks5://127.0.0.1:1080'>
+<div class=grid><div><label>开始日期（留空不限）</label>
+<input id='dateFrom' type=date></div>
+<div><label>结束日期（留空不限）</label>
+<input id='dateTo' type=date></div></div>
+<label>最大并发下载数</label>
+<input id='maxConcurrent' type=number value=3 min=1 max=10>
+<div class=check-row style='margin-top:8px'>
+<label><input type=checkbox id='notifyTg' checked> 下载通知推送到 Telegram</label>
+</div>
+</div>
+<div class=form-actions>
+<button class='btn primary' onclick='addMonitor()'>添加监控</button>
+<button class='btn' onclick='document.getElementById("addModal").style.display="none"'>取消</button>
+</div>
+</div></div>
+
+<script>
+let allGroups = [];
+async function loadGroups() {{
+  try {{
+    const resp = await fetch('/api/groups?limit=500');
+    const data = await resp.json();
+    allGroups = data.groups || [];
+    renderGroups(allGroups);
+  }} catch(e) {{
+    document.getElementById('groupLoading').textContent = '加载失败：' + e.message;
+  }}
+}}
+function renderGroups(groups) {{
+  const container = document.getElementById('groupList');
+  if (!groups.length) {{ container.innerHTML = '<div style="padding:16px" class=muted>未找到匹配项</div>'; return; }}
+  container.innerHTML = groups.map(g =>
+    `<div style="padding:10px 12px;border-bottom:1px solid #e0e0e0;cursor:pointer;display:flex;justify-content:space-between;align-items:center" onclick="selectGroup(${{g.id}},'${{g.title.replace(/'/g,"\\'")}}','${{(g.username||'').replace(/'/g,"\\'")}}')" onmouseover="this.style.background='#f0f0f0'" onmouseout="this.style.background='white'">
+     <div><b>${{g.title}}</b> ${{g.username ? '<small>@'+g.username+'</small>' : ''}}<br><small class=muted>${{g.type}} · id: ${{g.id}}</small></div>
+     <span class=badge>${{g.type}}</span></div>`
+  ).join('');
+}}
+function filterGroups() {{
+  const q = document.getElementById('groupSearch').value.toLowerCase();
+  if (!q) {{ renderGroups(allGroups); return; }}
+  const filtered = allGroups.filter(g => g.title.toLowerCase().includes(q) || (g.username||'').toLowerCase().includes(q) || String(g.id).includes(q));
+  renderGroups(filtered);
+}}
+function selectGroup(id, title, username) {{
+  document.getElementById('selectedGroup').style.display = 'block';
+  document.getElementById('selectedName').textContent = title + (username ? ' @'+username : '') + ' (' + id + ')';
+  document.getElementById('selChannelId').value = id;
+  document.getElementById('selChannelTitle').value = title;
+  document.getElementById('selChannelUsername').value = username;
+  document.getElementById('addModal').querySelector('h2').textContent = '确认添加';
+}}
+async function addMonitor() {{
+  const channelId = document.getElementById('selChannelId').value;
+  if (!channelId) {{ alert('请先选择一个频道/群组'); return; }}
+  const body = new URLSearchParams({{
+    channel_id: channelId,
+    channel_title: document.getElementById('selChannelTitle').value,
+    channel_username: document.getElementById('selChannelUsername').value,
+    media_types: document.getElementById('mediaTypes').value,
+    keywords: document.getElementById('mediaKeywords').value,
+    max_file_size_mb: document.getElementById('maxFileSize').value,
+    download_dir: document.getElementById('downloadDir').value,
+    proxy: document.getElementById('mediaProxy').value,
+    date_from: document.getElementById('dateFrom').value,
+    date_to: document.getElementById('dateTo').value,
+    max_concurrent: document.getElementById('maxConcurrent').value,
+    notify_telegram: document.getElementById('notifyTg').checked ? 'on' : '',
+  }});
+  try {{
+    const resp = await fetch('/api/monitors/create', {{ method: 'POST', headers: {{'Content-Type':'application/x-www-form-urlencoded'}}, body: body.toString() }});
+    if (resp.ok) {{ location.reload(); }}
+    else {{ const t = await resp.text(); alert('创建失败：' + t); }}
+  }} catch(e) {{ alert('创建失败：' + e.message); }}
+}}
+document.getElementById('addModal').addEventListener('click', function(e) {{ if (e.target === this) this.style.display='none'; }});
+</script>"""
+
+    @app.get("/channel-media", response_class=HTMLResponse)
+    async def channel_media_page(_: str = Depends(panel_auth)) -> str:
+        return layout("频道媒体", channel_media_page_html())
+
+    @app.get("/api/groups")
+    async def api_groups(_: str = Depends(panel_auth), q: str = "", limit: int = 500) -> dict[str, Any]:
+        if not user_session_ready():
+            return {"groups": [], "error": "TG user session not configured"}
+        if q.strip():
+            groups = await telethon_search_dialogs(q.strip(), limit=min(limit, 200))
+        else:
+            groups = await telethon_list_dialogs(limit=min(limit, 500))
+        groups = [g for g in groups if g.get("type") in ("group", "channel")]
+        return {"groups": groups}
+
+    @app.post("/api/monitors/create")
+    async def api_monitor_create(
+        _: str = Depends(panel_auth),
+        channel_id: str = Form(...),
+        channel_title: str = Form(""),
+        channel_username: str = Form(""),
+        media_types: str = Form("video,document"),
+        keywords: str = Form(""),
+        max_file_size_mb: int = Form(2000),
+        download_dir: str = Form(""),
+        notify_telegram: str | None = Form(None),
+        proxy: str = Form(""),
+        date_from: str = Form(""),
+        date_to: str = Form(""),
+        max_concurrent: int = Form(3),
+    ) -> RedirectResponse:
+        try:
+            cid = int(channel_id.strip())
+        except (ValueError, TypeError):
+            raise HTTPException(400, "invalid channel_id")
+        channel_media_monitor_create(
+            cid,
+            channel_title.strip() or str(cid),
+            channel_username.strip(),
+            media_types.strip() or "video,document",
+            keywords.strip(),
+            max(1, max_file_size_mb),
+            download_dir.strip(),
+            bool(notify_telegram),
+            proxy.strip(),
+            date_from.strip(),
+            date_to.strip(),
+            max(1, min(10, max_concurrent)),
+        )
+        return RedirectResponse("/channel-media", status_code=303)
+
+    @app.get("/channel-media/{monitor_id}/pause")
+    async def channel_media_pause(monitor_id: int, _: str = Depends(panel_auth)) -> RedirectResponse:
+        channel_media_monitor_update(monitor_id, status="paused")
+        return RedirectResponse("/channel-media", status_code=303)
+
+    @app.get("/channel-media/{monitor_id}/resume")
+    async def channel_media_resume(monitor_id: int, _: str = Depends(panel_auth)) -> RedirectResponse:
+        channel_media_monitor_update(monitor_id, status="active")
+        return RedirectResponse("/channel-media", status_code=303)
+
+    @app.get("/channel-media/{monitor_id}/delete")
+    async def channel_media_delete_route(monitor_id: int, _: str = Depends(panel_auth)) -> RedirectResponse:
+        channel_media_monitor_delete(monitor_id)
+        return RedirectResponse("/channel-media", status_code=303)
+
+    @app.get("/channel-media/{monitor_id}/check", response_class=HTMLResponse)
+    async def channel_media_check(monitor_id: int, _: str = Depends(panel_auth)) -> str:
+        count = await telethon_download_from_channel(monitor_id)
+        monitor = channel_media_monitor_get(monitor_id)
+        name = monitor.get("channel_title", "") if monitor else ""
+        return layout("检查完成", f"<div class=msg>已检查频道 {html_escape(name)}，新增 {count} 个文件。</div><p><a class=btn href='/channel-media'>返回</a></p>")
+
+    @app.get("/channel-media/{monitor_id}/download", response_class=HTMLResponse)
+    async def channel_media_download_history(monitor_id: int, _: str = Depends(panel_auth)) -> str:
+        monitor = channel_media_monitor_get(monitor_id)
+        if not monitor:
+            raise HTTPException(404)
+        downloads = channel_media_downloads_list(monitor_id, limit=200)
+        rows = ""
+        for d in downloads:
+            size_mb = f"{(d.get('file_size', 0) or 0) / 1024 / 1024:.1f} MB"
+            rows += f"<tr><td>{d.get('id')}</td><td>{html_escape(d.get('media_type',''))}</td>"
+            rows += f"<td>{html_escape(d.get('file_name',''))}<br><small class=muted>{html_escape(d.get('caption','')[:100])}</small></td>"
+            rows += f"<td>{size_mb}</td><td><small>{html_escape(d.get('created_at',''))}</small></td></tr>"
+        total = monitor.get("total_downloaded", 0)
+        size_mb = (monitor.get("total_size_bytes", 0) or 0) // 1024 // 1024
+        body = f"""<div class=card><h2>下载记录 - {html_escape(monitor.get('channel_title',''))}</h2>
+<p class=muted>累计：{total} 个文件，{size_mb} MB</p>
+<div class=actions style='margin-bottom:16px'>
+<a class='btn ok' href='/channel-media/{monitor_id}/check'>立即下载新内容</a>
+<a class='btn' href='/channel-media'>返回列表</a></div>
+<table><tr><th>ID</th><th>类型</th><th>文件名/说明</th><th>大小</th><th>时间</th></tr>{rows}</table></div>"""
+        return layout("下载记录", body)
+
     return app
 
 
@@ -3262,6 +3998,10 @@ async def main_async(run_once: bool = False, panel_only: bool = False) -> None:
             )
         else:
             user_session_listener_task = asyncio.create_task(run_user_session_group_listener())
+    if TelegramClient is not None and user_session_ready():
+        asyncio.create_task(channel_media_monitor_loop())
+    else:
+        logger.info("channel media monitor loop skipped: telethon not installed or user session not configured")
     await admin_send(f"tg-watchbot 已启动\n时间：{now_iso()}")
     logger.info("bot polling start")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())

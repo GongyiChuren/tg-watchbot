@@ -1,0 +1,103 @@
+document.getElementById('addModal').addEventListener('click', function(e) { if (e.target === this) this.style.display='none'; });
+</script>"""
+
+    @app.get("/channel-media", response_class=HTMLResponse)
+    async def channel_media_page(_: str = Depends(panel_auth)) -> str:
+        return layout("频道媒体", channel_media_page_html())
+
+    @app.get("/api/groups")
+    async def api_groups(_: str = Depends(panel_auth), q: str = "", limit: int = 500) -> dict[str, Any]:
+        if not user_session_ready():
+            return {"groups": [], "error": "TG user session not configured"}
+        if q.strip():
+            groups = await telethon_search_dialogs(q.strip(), limit=min(limit, 200))
+        else:
+            groups = await telethon_list_dialogs(limit=min(limit, 500))
+        groups = [g for g in groups if g.get("type") in ("group", "channel")]
+        return {"groups": groups}
+
+    @app.post("/api/monitors/create")
+    async def api_monitor_create(
+        _: str = Depends(panel_auth),
+        channel_id: str = Form(...),
+        channel_title: str = Form(""),
+        channel_username: str = Form(""),
+        media_types: str = Form("video,document"),
+        keywords: str = Form(""),
+        max_file_size_mb: int = Form(2000),
+        download_dir: str = Form(""),
+        notify_telegram: str | None = Form(None),
+        proxy: str = Form(""),
+        date_from: str = Form(""),
+        date_to: str = Form(""),
+        max_concurrent: int = Form(3),
+        forward_mode: str | None = Form(None),
+        forward_to: str = Form("admin"),
+    ) -> RedirectResponse:
+        try:
+            cid = int(channel_id.strip())
+        except (ValueError, TypeError):
+            raise HTTPException(400, "invalid channel_id")
+        channel_media_monitor_create(
+            cid,
+            channel_title.strip() or str(cid),
+            channel_username.strip(),
+            media_types.strip() or "video,document",
+            keywords.strip(),
+            max(1, max_file_size_mb),
+            download_dir.strip(),
+            bool(notify_telegram),
+            proxy.strip(),
+            date_from.strip(),
+            date_to.strip(),
+            max(1, min(10, max_concurrent)),
+            bool(forward_mode),
+            forward_to.strip() or "admin",
+        )
+        return RedirectResponse("/channel-media", status_code=303)
+
+    @app.get("/channel-media/{monitor_id}/pause")
+    async def channel_media_pause(monitor_id: int, _: str = Depends(panel_auth)) -> RedirectResponse:
+        channel_media_monitor_update(monitor_id, status="paused")
+        return RedirectResponse("/channel-media", status_code=303)
+
+    @app.get("/channel-media/{monitor_id}/resume")
+    async def channel_media_resume(monitor_id: int, _: str = Depends(panel_auth)) -> RedirectResponse:
+        channel_media_monitor_update(monitor_id, status="active")
+        return RedirectResponse("/channel-media", status_code=303)
+
+    @app.get("/channel-media/{monitor_id}/delete")
+    async def channel_media_delete_route(monitor_id: int, _: str = Depends(panel_auth)) -> RedirectResponse:
+        channel_media_monitor_delete(monitor_id)
+        return RedirectResponse("/channel-media", status_code=303)
+
+    @app.get("/channel-media/{monitor_id}/check", response_class=HTMLResponse)
+    async def channel_media_check(monitor_id: int, _: str = Depends(panel_auth)) -> str:
+        count = await telethon_download_from_channel(monitor_id)
+        monitor = channel_media_monitor_get(monitor_id)
+        name = monitor.get("channel_title", "") if monitor else ""
+        return layout("检查完成", f"<div class=msg>已检查频道 {html_escape(name)}，新增 {count} 个文件。</div><p><a class=btn href='/channel-media'>返回</a></p>")
+
+    @app.get("/channel-media/{monitor_id}/download", response_class=HTMLResponse)
+    async def channel_media_download_history(monitor_id: int, _: str = Depends(panel_auth)) -> str:
+        monitor = channel_media_monitor_get(monitor_id)
+        if not monitor:
+            raise HTTPException(404)
+        downloads = channel_media_downloads_list(monitor_id, limit=200)
+        rows = ""
+        for d in downloads:
+            size_mb = f"{(d.get('file_size', 0) or 0) / 1024 / 1024:.1f} MB"
+            rows += f"<tr><td>{d.get('id')}</td><td>{html_escape(d.get('media_type',''))}</td>"
+            rows += f"<td>{html_escape(d.get('file_name',''))}<br><small class=muted>{html_escape(d.get('caption','')[:100])}</small></td>"
+            rows += f"<td>{size_mb}</td><td><small>{html_escape(d.get('created_at',''))}</small></td></tr>"
+        total = monitor.get("total_downloaded", 0)
+        size_mb = (monitor.get("total_size_bytes", 0) or 0) // 1024 // 1024
+        body = f"""<div class=card><h2>下载记录 - {html_escape(monitor.get('channel_title',''))}</h2>
+<p class=muted>累计：{total} 个文件，{size_mb} MB</p>
+<div class=actions style='margin-bottom:16px'>
+<a class='btn ok' href='/channel-media/{monitor_id}/check'>立即下载新内容</a>
+<a class='btn' href='/channel-media'>返回列表</a></div>
+<table><tr><th>ID</th><th>类型</th><th>文件名/说明</th><th>大小</th><th>时间</th></tr>{rows}</table></div>"""
+        return layout("下载记录", body)
+
+    return app

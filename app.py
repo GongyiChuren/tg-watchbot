@@ -250,6 +250,8 @@ def init_db() -> None:
                 date_from TEXT DEFAULT '',
                 date_to TEXT DEFAULT '',
                 max_concurrent INTEGER DEFAULT 3,
+                forward_mode INTEGER DEFAULT 0,
+                forward_to TEXT DEFAULT 'admin',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -277,6 +279,8 @@ def init_db() -> None:
             "ALTER TABLE channel_media_monitors ADD COLUMN date_from TEXT DEFAULT ''",
             "ALTER TABLE channel_media_monitors ADD COLUMN date_to TEXT DEFAULT ''",
             "ALTER TABLE channel_media_monitors ADD COLUMN max_concurrent INTEGER DEFAULT 3",
+            "ALTER TABLE channel_media_monitors ADD COLUMN forward_mode INTEGER DEFAULT 0",
+            "ALTER TABLE channel_media_monitors ADD COLUMN forward_to TEXT DEFAULT 'admin'",
         ]:
             try:
                 conn.execute(sql)
@@ -647,6 +651,8 @@ def channel_media_monitor_create(
     date_from: str = "",
     date_to: str = "",
     max_concurrent: int = 3,
+    forward_mode: bool = False,
+    forward_to: str = "admin",
 ) -> int:
     ts = now_iso()
     with closing(db()) as conn:
@@ -654,11 +660,12 @@ def channel_media_monitor_create(
             """INSERT INTO channel_media_monitors
             (channel_id, channel_title, channel_username, status, media_types, keywords,
              max_file_size_mb, download_dir, notify_telegram, proxy, date_from, date_to,
-             max_concurrent, created_at, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             max_concurrent, forward_mode, forward_to, created_at, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (channel_id, channel_title, channel_username, "active", media_types, keywords,
              max_file_size_mb, download_dir, 1 if notify_telegram else 0,
-             proxy, date_from, date_to, max_concurrent, ts, ts),
+             proxy, date_from, date_to, max_concurrent, 1 if forward_mode else 0,
+             forward_to, ts, ts),
         )
         conn.commit()
         return int(cur.lastrowid)
@@ -667,7 +674,7 @@ def channel_media_monitor_create(
 def channel_media_monitor_update(monitor_id: int, **kwargs: Any) -> None:
     allowed = {"status", "media_types", "keywords", "max_file_size_mb", "download_dir",
                "last_message_id", "notify_telegram", "total_downloaded", "total_size_bytes",
-               "proxy", "date_from", "date_to", "max_concurrent"}
+               "proxy", "date_from", "date_to", "max_concurrent", "forward_mode", "forward_to"}
     updates = []
     values = []
     for k, v in kwargs.items():
@@ -869,6 +876,92 @@ async def channel_media_monitor_loop() -> None:
             logger.exception("channel_media_monitor_loop error")
         finally:
             await disconnect_channel_media_client()
+
+
+async def channel_media_forward_listener() -> None:
+    """Real-time listener: forward messages from monitored groups to admin Telegram."""
+    if TelegramClient is None or StringSession is None:
+        logger.info("channel media forward listener skipped: telethon not installed")
+        return
+    api_id_raw, api_hash, session = user_session_config()
+    if not api_id_raw or not api_hash or not session:
+        logger.info("channel media forward listener skipped: user session not configured")
+        return
+    try:
+        api_id = int(api_id_raw)
+    except Exception:
+        return
+    try:
+        client = TelegramClient(StringSession(session), api_id, api_hash)
+
+        def _get_forward_monitors() -> dict[int, dict[str, Any]]:
+            monitors = channel_media_monitors_all()
+            result = {}
+            for m in monitors:
+                if m.get("status") != "active" or not m.get("forward_mode"):
+                    continue
+                try:
+                    cid = int(m["channel_id"])
+                    result[cid] = m
+                except (TypeError, ValueError):
+                    continue
+            return result
+
+        @client.on(events.NewMessage(incoming=True))
+        async def on_new_message_for_forward(event: Any) -> None:
+            try:
+                chat_id = getattr(event, "chat_id", None)
+                if chat_id is None:
+                    return
+                fwd_monitors = _get_forward_monitors()
+                monitor = fwd_monitors.get(int(chat_id))
+                if not monitor:
+                    return
+                msg = event.message
+                text = (msg.text or "") + " " + (msg.caption or "")
+                # Keyword filter
+                keywords_str = str(monitor.get("keywords") or "").strip()
+                if keywords_str:
+                    keywords_list = [k.strip() for k in keywords_str.split(",") if k.strip()]
+                    if keywords_list and not any(k.lower() in text.lower() for k in keywords_list):
+                        return
+                # Media type filter
+                media_types_str = str(monitor.get("media_types") or "").strip()
+                if media_types_str:
+                    allowed = {t.strip().lower() for t in media_types_str.split(",") if t.strip()}
+                    if allowed and not msg.media:
+                        has_text_only = bool(text.strip())
+                        if not has_text_only:
+                            return
+                # Determine forward target
+                forward_to = str(monitor.get("forward_to") or "admin").strip()
+                if forward_to == "admin":
+                    targets = all_admin_chat_ids()
+                elif forward_to == "saved":
+                    targets = ["me"]
+                else:
+                    try:
+                        targets = [int(forward_to)]
+                    except (TypeError, ValueError):
+                        targets = all_admin_chat_ids()
+                # Forward the message
+                for target in targets:
+                    try:
+                        await msg.forward_to(target)
+                    except Exception:
+                        logger.exception("forward failed target=%s msg_id=%s", target, msg.id)
+                logger.info("forwarded message from chat=%s msg_id=%s to %s", chat_id, msg.id, targets)
+            except Exception:
+                logger.exception("on_new_message_for_forward error")
+
+        await client.start()
+        logger.info("channel media forward listener started")
+        await client.run_until_disconnected()
+    except asyncio.CancelledError:
+        logger.info("channel media forward listener cancelled")
+        raise
+    except Exception:
+        logger.exception("channel media forward listener crashed")
 
 
 async def telethon_download_from_channel(monitor_id: int, download_history: bool = False) -> int:
@@ -3688,8 +3781,6 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
                 badge_html = '<span class="badge" style="background:#eab308">已暂停</span>'
             else:
                 badge_html = '<span class="badge" style="background:#6b7280">已停止</span>'
-            total = m.get("total_downloaded", 0)
-            size_mb = (m.get("total_size_bytes", 0) or 0) // 1024 // 1024
             username = f"@{m.get('channel_username', '')}" if m.get("channel_username") else ""
             pause_btn = ""
             if status == "active":
@@ -3697,22 +3788,17 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
             elif status == "paused":
                 pause_btn = f"<a class='btn ok' href='/channel-media/{m['id']}/resume'>恢复</a>"
             proxy_info = " · 代理: " + html_escape(m.get("proxy", "")) if m.get("proxy") else ""
-            date_info = ""
-            if m.get("date_from") or m.get("date_to"):
-                date_info = " · 日期: " + html_escape(m.get("date_from", "")) + "~" + html_escape(m.get("date_to", ""))
             cards_html += f"""<div class=card style='margin:12px 0'>
 <div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px'>
 <div><h3 style='margin:0 0 4px'>{badge_html} {html_escape(m.get('channel_title',''))} {html_escape(username)}</h3>
-<small class=muted>chat_id: {m.get('channel_id','')} · 媒体类型: {html_escape(m.get('media_types',''))} · 并发: {m.get('max_concurrent',3)} · 已下载: {total} 个 · {size_mb} MB{proxy_info}{date_info}</small></div>
+<small class=muted>chat_id: {m.get('channel_id','')} · 转发: {'开启' if m.get('forward_mode') else '关闭'}{proxy_info}</small></div>
 <div class=actions>
 {pause_btn}
-<a class='btn ok' href='/channel-media/{m['id']}/download'>下载历史</a>
-<a class='btn' href='/channel-media/{m['id']}/check'>立即检查</a>
 <a class='btn danger' href='/channel-media/{m['id']}/delete' onclick='return confirm("确定删除该监控？")'>删除</a>
 </div></div></div>"""
         return f"""<div class=card>
-<div class=toolbar><div><h2 style='margin:0 0 6px'>频道媒体监控</h2>
-<p class=muted style='margin:0'>使用你的 TG 账号监控频道/群组，自动下载媒体文件。</p></div>
+<div class=toolbar><div><h2 style='margin:0 0 6px'>频道媒体转发</h2>
+<p class=muted style='margin:0'>使用你的 TG 账号监听群组，消息实时转发到你的 Telegram。</p></div>
 <div class=actions><button class='btn primary' onclick='document.getElementById("addModal").style.display="flex"'>添加频道/群组</button></div></div>
 {notice}{cards_html}</div>
 
@@ -3733,25 +3819,17 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
 <input type=hidden id='selChannelUsername' name='channel_username'>
 </div>
 <div style='margin-top:14px'>
-<label>媒体类型（逗号分隔）</label>
-<input id='mediaTypes' value='video,document' placeholder='video,document,photo,audio'>
-<label>关键词过滤（逗号分隔，可留空）</label>
-<input id='mediaKeywords' placeholder='留空则下载所有'>
-<label>最大文件大小 (MB)</label>
-<input id='maxFileSize' type=number value=2000 min=1>
-<label>下载目录（留空使用默认）</label>
-<input id='downloadDir' placeholder='留空则使用默认目录'>
+<label>关键词过滤（逗号分隔，留空则转发所有消息）</label>
+<input id='mediaKeywords' placeholder='留空则转发所有消息'>
+<label>媒体类型过滤（逗号分隔，留空不限）</label>
+<input id='mediaTypes' value='' placeholder='video,document,photo,audio（留空=所有类型）'>
 <label>代理（留空不用，支持 socks5://host:port 或 http://host:port）</label>
 <input id='mediaProxy' placeholder='socks5://127.0.0.1:1080'>
-<div class=grid><div><label>开始日期（留空不限）</label>
-<input id='dateFrom' type=date></div>
-<div><label>结束日期（留空不限）</label>
-<input id='dateTo' type=date></div></div>
-<label>最大并发下载数</label>
-<input id='maxConcurrent' type=number value=3 min=1 max=10>
 <div class=check-row style='margin-top:8px'>
-<label><input type=checkbox id='notifyTg' checked> 下载通知推送到 Telegram</label>
+<label><input type=checkbox id='forwardMode' checked> 实时转发到 Telegram</label>
 </div>
+<div><label>转发目标</label>
+<select id='forwardTo'><option value='admin'>管理员</option><option value='saved'>我的收藏(Saved Messages)</option></select></div>
 </div>
 <div class=form-actions>
 <button class='btn primary' onclick='addMonitor()'>添加监控</button>
@@ -3803,13 +3881,9 @@ async function addMonitor() {{
     channel_username: document.getElementById('selChannelUsername').value,
     media_types: document.getElementById('mediaTypes').value,
     keywords: document.getElementById('mediaKeywords').value,
-    max_file_size_mb: document.getElementById('maxFileSize').value,
-    download_dir: document.getElementById('downloadDir').value,
     proxy: document.getElementById('mediaProxy').value,
-    date_from: document.getElementById('dateFrom').value,
-    date_to: document.getElementById('dateTo').value,
-    max_concurrent: document.getElementById('maxConcurrent').value,
-    notify_telegram: document.getElementById('notifyTg').checked ? 'on' : '',
+    forward_mode: document.getElementById('forwardMode').checked ? 'on' : '',
+    forward_to: document.getElementById('forwardTo').value,
   }});
   try {{
     const resp = await fetch('/api/monitors/create', {{ method: 'POST', headers: {{'Content-Type':'application/x-www-form-urlencoded'}}, body: body.toString() }});
@@ -3850,6 +3924,8 @@ document.getElementById('addModal').addEventListener('click', function(e) {{ if 
         date_from: str = Form(""),
         date_to: str = Form(""),
         max_concurrent: int = Form(3),
+        forward_mode: str | None = Form(None),
+        forward_to: str = Form("admin"),
     ) -> RedirectResponse:
         try:
             cid = int(channel_id.strip())
@@ -3868,6 +3944,8 @@ document.getElementById('addModal').addEventListener('click', function(e) {{ if 
             date_from.strip(),
             date_to.strip(),
             max(1, min(10, max_concurrent)),
+            bool(forward_mode),
+            forward_to.strip() or "admin",
         )
         return RedirectResponse("/channel-media", status_code=303)
 
@@ -3960,7 +4038,6 @@ async def main_async(run_once: bool = False, panel_only: bool = False) -> None:
         while True:
             await asyncio.sleep(3600)
     if run_once:
-        # If .env is filled, send notifications during manual test; otherwise just log.
         try:
             token, admin_chat_id = validate_env()
             admin_chat_ids = parse_admin_chat_ids(os.getenv("ADMIN_CHAT_ID", ""))
@@ -3999,9 +4076,10 @@ async def main_async(run_once: bool = False, panel_only: bool = False) -> None:
         else:
             user_session_listener_task = asyncio.create_task(run_user_session_group_listener())
     if TelegramClient is not None and user_session_ready():
-        asyncio.create_task(channel_media_monitor_loop())
+        asyncio.create_task(channel_media_forward_listener())
+        logger.info("channel media forward listener started")
     else:
-        logger.info("channel media monitor loop skipped: telethon not installed or user session not configured")
+        logger.info("channel media forward listener skipped: telethon not installed or user session not configured")
     await admin_send(f"tg-watchbot 已启动\n时间：{now_iso()}")
     logger.info("bot polling start")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())

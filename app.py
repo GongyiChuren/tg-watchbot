@@ -16,6 +16,7 @@ import html
 import io
 import logging
 import os
+import random
 import re
 import secrets
 import signal
@@ -43,7 +44,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.client.default import DefaultBotProperties
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
@@ -56,6 +57,12 @@ except Exception:  # pragma: no cover - optional dependency
     TelegramClient = None
     events = None
     StringSession = None
+
+try:
+    from captcha_gen import generate_captcha_text, render_captcha_image
+except Exception:  # pragma: no cover - captcha optional
+    generate_captcha_text = None
+    render_captcha_image = None
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "tg-watchbot.sqlite3"
@@ -303,6 +310,7 @@ def init_db() -> None:
             "ALTER TABLE telegram_login_sessions ADD COLUMN user_id TEXT DEFAULT ''",
             "ALTER TABLE telegram_login_sessions ADD COLUMN phone TEXT DEFAULT ''",
             "ALTER TABLE telegram_login_sessions ADD COLUMN status TEXT DEFAULT 'empty'",
+            "ALTER TABLE users ADD COLUMN verified INTEGER DEFAULT 0",
         ]:
             try:
                 conn.execute(sql)
@@ -486,6 +494,123 @@ def spam_keyword_hits(text: str) -> list[str]:
     if not settings["enabled"]:
         return []
     return keyword_hits(text, settings["keywords"])
+
+
+# ---------- 人机验证（新用户首条私聊消息先过图片验证码） ----------
+
+captcha_state: dict[int, dict[str, Any]] = {}
+
+
+def verification_settings() -> dict[str, Any]:
+    vf = (config.get("bot") or {}).get("verification") or {}
+    return {
+        "enabled": bool(vf.get("enabled", False)),
+        "expires_minutes": max(1, int(vf.get("expires_minutes", 10))),
+    }
+
+
+def is_verified(user_id: int) -> bool:
+    row = get_user(user_id)
+    try:
+        return bool(row and row["verified"])
+    except (IndexError, KeyError):
+        return False
+
+
+def set_verified(user_id: int, verified: bool) -> None:
+    with closing(db()) as conn:
+        conn.execute(
+            "UPDATE users SET verified=?, updated_at=? WHERE user_id=?",
+            (1 if verified else 0, now_iso(), user_id),
+        )
+        conn.commit()
+
+
+def captcha_issue(user_id: int, text: str, msg_id: int | None = None) -> None:
+    ttl = verification_settings()["expires_minutes"] * 60
+    captcha_state[user_id] = {
+        "text": str(text).upper(),
+        "msg_id": msg_id,
+        "created_at": time.time(),
+        "expires": time.time() + ttl,
+    }
+
+
+def captcha_pop(user_id: int) -> None:
+    captcha_state.pop(user_id, None)
+
+
+def captcha_active(user_id: int) -> bool:
+    st = captcha_state.get(user_id)
+    if not st:
+        return False
+    if time.time() > float(st["expires"]):
+        captcha_pop(user_id)
+        return False
+    return True
+
+
+def captcha_check(user_id: int, answer: str) -> str:
+    """Return 'ok' | 'expired' | 'wrong'.
+
+    Anti-brute-force: wrong answer immediately invalidates the current
+    captcha, so each challenge can only be answered once — a bot must
+    solve every new image, never retry the same one.
+    """
+    st = captcha_state.get(user_id)
+    if not st:
+        return "expired"
+    if time.time() > float(st["expires"]):
+        captcha_pop(user_id)
+        return "expired"
+    if str(answer).strip().upper() == str(st["text"]):
+        captcha_pop(user_id)
+        return "ok"
+    # wrong -> invalidate immediately, caller must issue a fresh captcha
+    captcha_pop(user_id)
+    return "wrong"
+
+
+async def send_captcha_challenge(message: Message, reason: str) -> None:
+    uid = message.from_user.id if message.from_user else None
+    if not uid or not bot:
+        return
+    text = generate_captcha_text()
+    jpg = render_captcha_image(text)
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="换一张验证码", callback_data="captcha:new")]]
+    )
+    photo = BufferedInputFile(jpg, filename="captcha.jpg")
+    caption = (
+        f"检测到首次使用，需要先完成人机验证后消息才会转交。\n"
+        f"请直接回复图片中的 {reason}（不区分大小写）。"
+    )
+    sent = await message.answer_photo(photo=photo, caption=caption, reply_markup=keyboard)
+    captcha_issue(uid, text, sent.message_id)
+
+
+# ---------- 自动回复（忙碌/离线状态下自动答复私聊用户） ----------
+
+AUTO_REPLY_MIN_INTERVAL_SECONDS = 300
+
+auto_reply_buckets: dict[int, float] = {}
+
+
+def auto_reply_settings() -> dict[str, Any]:
+    ar = (config.get("bot") or {}).get("auto_reply") or {}
+    return {
+        "enabled": bool(ar.get("enabled", False)),
+        "text": str(ar.get("text") or "").strip(),
+        "min_interval_minutes": max(1, int(ar.get("min_interval_minutes", 30))),
+    }
+
+
+def auto_reply_allowed(user_id: int, min_interval_minutes: int) -> bool:
+    last = auto_reply_buckets.get(user_id, 0.0)
+    if time.time() - last < max(AUTO_REPLY_MIN_INTERVAL_SECONDS, min_interval_minutes * 60):
+        return False
+    auto_reply_buckets[user_id] = time.time()
+    return True
 
 
 def ai_api_url(base_url: str, path: str) -> str:
@@ -1808,7 +1933,12 @@ async def start(message: Message) -> None:
         return
     upsert_user(uid, full, username)
     if is_blocked(uid):
-        await message.answer("你当前无法发送消息。")
+        return
+    if verification_settings()["enabled"] and not is_verified(uid):
+        if not captcha_active(uid):
+            await send_captcha_challenge(message, "4位字符")
+        else:
+            await message.answer("请先回复上一条验证码图片中的字符完成验证。")
         return
     await message.answer("已连接客服/管理员。你发来的消息会转交给管理员，请直接输入内容。")
 
@@ -1905,6 +2035,58 @@ async def cmd_unblock(message: Message, command: CommandObject) -> None:
         await message.reply(f"/unblock 失败：{e}")
 
 
+@router.message(Command("verify"))
+async def cmd_verify(message: Message, command: CommandObject) -> None:
+    if not is_admin_chat(message):
+        return
+    try:
+        uid = parse_user_id(command.args)
+        if not get_user(uid):
+            await message.reply(f"错误：找不到用户 {uid}")
+            return
+        set_verified(uid, True)
+        captcha_pop(uid)
+        await message.reply(f"已人工验证用户 {uid}，之后消息直接转交。")
+    except Exception as e:
+        logger.exception("/verify failed")
+        await message.reply(f"/verify 失败：{e}")
+
+
+@router.message(Command("unverify"))
+async def cmd_unverify(message: Message, command: CommandObject) -> None:
+    if not is_admin_chat(message):
+        return
+    try:
+        uid = parse_user_id(command.args)
+        if not get_user(uid):
+            await message.reply(f"错误：找不到用户 {uid}")
+            return
+        set_verified(uid, False)
+        await message.reply(f"已撤销用户 {uid} 的验证，下次私聊需要重新过验证码。")
+    except Exception as e:
+        logger.exception("/unverify failed")
+        await message.reply(f"/unverify 失败：{e}")
+
+
+@router.message(Command("verifylist"))
+async def cmd_verifylist(message: Message) -> None:
+    if not is_admin_chat(message):
+        return
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT user_id, full_name, username, verified, blocked FROM users WHERE verified=0 AND blocked=0 ORDER BY updated_at DESC LIMIT 20"
+        ).fetchall()
+    if not rows:
+        await message.reply("没有待验证/未验证的活跃用户。")
+        return
+    lines = ["未验证用户（最近 20 个）："]
+    lines += [
+        f"- {r['user_id']} {html_escape(r['full_name'] or '')} @{html_escape(r['username'] or '')}"
+        for r in rows
+    ]
+    await message.reply("\n".join(lines))
+
+
 @router.message(Command("note"))
 async def cmd_note(message: Message, command: CommandObject) -> None:
     if not is_admin_chat(message):
@@ -1977,6 +2159,22 @@ async def cmd_spamdel(message: Message, command: CommandObject) -> None:
         return
     words = update_spam_keywords("delete", word)
     await message.reply(f"已删除广告关键词：{html_escape(word)}\n当前共 {len(words)} 个。")
+
+
+@router.callback_query(F.data == "captcha:new")
+async def cb_captcha_new(callback: CallbackQuery) -> None:
+    uid = callback.from_user.id
+    await callback.answer()
+    if not verification_settings()["enabled"] or is_verified(uid):
+        return
+    prev = captcha_state.get(uid)
+    old_msg_id = int(prev["msg_id"]) if prev and prev.get("msg_id") else None
+    if old_msg_id and bot:
+        try:
+            await bot.delete_message(uid, old_msg_id)
+        except Exception:
+            pass
+    await send_captcha_challenge(callback.message, "4位字符")
 
 
 @router.message(is_admin_action_message)
@@ -2058,7 +2256,24 @@ async def user_message(message: Message) -> None:
         return
     upsert_user(uid, full, username)
     if is_blocked(uid):
-        await message.answer("你当前无法发送消息。")
+        return
+    # 人机验证门：未验证用户先完成验证码，消息不转发不落库。
+    # 验证阶段同样限流：答错一次即作废换新码 + 限流，杜绝同图重试爆破。
+    if verification_settings()["enabled"] and not is_verified(uid):
+        if rate_limited(uid):
+            await message.answer("发送太快了，请稍后再试。")
+            return
+        if not captcha_active(uid):
+            await send_captcha_challenge(message, "4位字符")
+            return
+        result = captcha_check(uid, message.text or "")
+        if result == "ok":
+            set_verified(uid, True)
+            await message.answer("验证通过，现在可以直接发送消息了，会转交管理员。")
+            return
+        # wrong / expired：一律立刻发新验证码（旧码已作废，无法对同一张图重试）
+        await send_captcha_challenge(message, "新的4位字符")
+        await message.answer("验证码不对或已过期，旧验证码作废，请回复新图片中的字符。")
         return
     if rate_limited(uid):
         await message.answer("发送太快了，请稍后再试。")
@@ -2066,13 +2281,17 @@ async def user_message(message: Message) -> None:
     inbox_id = create_inbox_message(message, uid, full, username)
     spam_hits = spam_keyword_hits(message.text or message.caption or "")
     if spam_hits and spam_filter_settings()["auto_block"]:
+        # 静默拉黑：不通知管理员、不回复用户，仅在面板/收件箱留痕。
         set_block(uid, True)
         mark_inbox_error(inbox_id, "spam: " + ", ".join(spam_hits))
-        await admin_send(
-            f"[垃圾消息已拉黑]\nuser_id: <code>{uid}</code>\n命中：{html_escape(', '.join(spam_hits))}\n内容：{html_escape((message.text or message.caption or '')[:300])}"
-        )
-        await message.answer("消息已被系统拦截。")
+        logger.info("spam auto-blocked user_id=%s inbox_id=%s hits=%s", uid, inbox_id, spam_hits)
         return
+    ar = auto_reply_settings()
+    if ar["enabled"] and ar["text"] and auto_reply_allowed(uid, ar["min_interval_minutes"]):
+        try:
+            await bot.send_message(uid, ar["text"])  # type: ignore[union-attr]
+        except Exception:
+            logger.exception("auto reply failed user_id=%s", uid)
     user_row = get_user(uid)
     note = user_row["note"] if user_row and "note" in user_row.keys() else ""
     header = (
@@ -3753,13 +3972,17 @@ async function logoutTgSession() {{
     async def users_page(_: str = Depends(panel_auth)) -> str:
         v = env_values()
         with closing(db()) as conn:
-            rows = conn.execute("SELECT user_id, username, full_name, blocked, note, updated_at FROM users ORDER BY updated_at DESC LIMIT 300").fetchall()
+            rows = conn.execute("SELECT user_id, username, full_name, blocked, verified, note, updated_at FROM users ORDER BY updated_at DESC LIMIT 300").fetchall()
         trs = []
         for u in rows:
             status_txt = "封禁" if u["blocked"] else "正常"
             action = "unblock" if u["blocked"] else "block"
             action_txt = "解封" if u["blocked"] else "封禁"
-            trs.append(f"""<tr><td><b>{html_escape(u['full_name'] or u['user_id'])}</b><br><small>{u['user_id']} @{html_escape(u['username'] or '')}</small></td><td><span class=badge>{status_txt}</span><br><small>{html_escape(u['updated_at'])}</small></td><td>{html_escape(u['note'] or '')}</td><td><form method=post action='/users/{u['user_id']}/note'><input name=note value='{html_escape(u['note'] or '')}'><button class=btn type=submit>备注</button></form><div class=actions><a class=btn href='/send?user_id={u['user_id']}'>发消息</a><a class='btn danger' href='/users/{u['user_id']}/{action}'>{action_txt}</a></div></td></tr>""")
+            verified = bool(u["verified"]) if "verified" in u.keys() else False
+            verified_badge = "<span class='badge ok'>已验证</span>" if verified else "<span class=badge>未验证</span>"
+            vaction = "unverify" if verified else "verify"
+            vaction_txt = "撤销验证" if verified else "人工验证"
+            trs.append(f"""<tr><td><b>{html_escape(u['full_name'] or u['user_id'])}</b><br><small>{u['user_id']} @{html_escape(u['username'] or '')}</small></td><td><span class=badge>{status_txt}</span><br>{verified_badge}<br><small>{html_escape(u['updated_at'])}</small></td><td>{html_escape(u['note'] or '')}</td><td><form method=post action='/users/{u['user_id']}/note'><input name=note value='{html_escape(u['note'] or '')}'><button class=btn type=submit>备注</button></form><div class=actions><a class=btn href='/send?user_id={u['user_id']}'>发消息</a><a class=btn href='/users/{u['user_id']}/{vaction}'>{vaction_txt}</a><a class='btn danger' href='/users/{u['user_id']}/{action}'>{action_txt}</a></div></td></tr>""")
         settings_card = f"""<div class=card><h2>Bot / 面板配置</h2><p class=muted>这里和“Bot / 面板设置”共用同一份 .env。修改 Token、管理员 ID、端口、账号或密码后不会自动重启，需要手动重启服务。</p><form method=post action='/users/settings'>
 <label>Telegram Bot Token</label><input name=TELEGRAM_BOT_TOKEN value='{html_escape(v['TELEGRAM_BOT_TOKEN'])}' placeholder='123456:ABC...'>
 <label>管理员 ADMIN_CHAT_ID（最多 3 个，用逗号分隔）</label><input name=ADMIN_CHAT_ID value='{html_escape(v['ADMIN_CHAT_ID'])}'>
@@ -3845,15 +4068,37 @@ async function logoutTgSession() {{
         set_block(user_id, False)
         return RedirectResponse("/users", status_code=303)
 
+    @app.get("/users/{user_id}/verify")
+    async def user_verify(user_id: int, _: str = Depends(panel_auth)) -> RedirectResponse:
+        set_verified(user_id, True)
+        captcha_pop(user_id)
+        return RedirectResponse("/users", status_code=303)
+
+    @app.get("/users/{user_id}/unverify")
+    async def user_unverify(user_id: int, _: str = Depends(panel_auth)) -> RedirectResponse:
+        set_verified(user_id, False)
+        return RedirectResponse("/users", status_code=303)
+
     @app.get("/rules", response_class=HTMLResponse)
     async def rules_page(_: str = Depends(panel_auth)) -> str:
         cfg = cfg_load_fresh()
         spam = (cfg.get("bot") or {}).get("spam_filter") or {}
         keywords = "\n".join(spam.get("keywords") or [])
-        body = f"""<div class=card><h2>私聊广告拦截</h2><p class=muted>只拦截用户私聊 Bot 的双向对话消息，不影响 RSS/Web 监控关键词。监控内容过滤请使用监控配置里的屏蔽词。</p><form method=post>
+        vf = (cfg.get("bot") or {}).get("verification") or {}
+        ar = (cfg.get("bot") or {}).get("auto_reply") or {}
+        body = f"""<div class=card><h2>私聊广告拦截</h2><p class=muted>只拦截用户私聊 Bot 的双向对话消息，不影响 RSS/Web 监控关键词。监控内容过滤请使用监控配置里的屏蔽词。命中且开启自动拉黑时：静默拉黑，不转发、不通知管理员。</p><form method=post>
 <div class=check-row><label><input type=checkbox name=enabled {'checked' if spam.get('enabled') else ''}> 启用</label><label><input type=checkbox name=auto_block {'checked' if spam.get('auto_block', True) else ''}> 命中后自动拉黑</label></div>
 <label>广告关键词（一行一个）</label><textarea name=keywords>{html_escape(keywords)}</textarea>
-<div class=form-actions><button class='btn primary' type=submit>保存规则</button></div></form></div>"""
+<div class=form-actions><button class='btn primary' type=submit>保存规则</button></div></form></div>
+<div class=card><h2>人机验证</h2><p class=muted>新用户第一次私聊 Bot 需要先回复图片验证码才能转发消息；已验证用户长期有效。人工命令：/verify /unverify /verifylist。</p><form method=post action='/rules/verification'>
+<div class=check-row><label><input type=checkbox name=enabled {'checked' if vf.get('enabled') else ''}> 启用人机验证</label></div>
+<label>验证码有效期（分钟）</label><input name=expires_minutes value='{html_escape(vf.get('expires_minutes', 10))}'></p>
+<div class=form-actions><button class='btn primary' type=submit>保存验证设置</button></div></form></div>
+<div class=card><h2>自动回复</h2><p class=muted>用户私聊发来消息时自动答复（例如「已转发，佬友我在睡觉，睡醒回复」）。同一用户按间隔去重，不会每条消息都回。</p><form method=post action='/rules/auto-reply'>
+<div class=check-row><label><input type=checkbox name=enabled {'checked' if ar.get('enabled') else ''}> 启用自动回复</label></div>
+<label>回复内容</label><textarea name=text>{html_escape(ar.get('text') or '')}</textarea>
+<label>同一用户最小间隔（分钟，最小 5）</label><input name=min_interval_minutes value='{html_escape(ar.get('min_interval_minutes', 30))}'>
+<div class=form-actions><button class='btn primary' type=submit>保存自动回复</button></div></form></div>"""
         return layout("拦截规则", body)
 
     @app.post("/rules")
@@ -3864,6 +4109,36 @@ async function logoutTgSession() {{
             "enabled": bool(enabled),
             "auto_block": bool(auto_block),
             "keywords": parse_lines(keywords),
+        }
+        cfg_save(cfg)
+        return RedirectResponse("/rules", status_code=303)
+
+    @app.post("/rules/verification")
+    async def rules_verification_save(_: str = Depends(panel_auth), enabled: str | None = Form(None), expires_minutes: int = Form(10)) -> RedirectResponse:
+        cfg = cfg_load_fresh()
+        bot_cfg = cfg.setdefault("bot", {})
+        bot_cfg["verification"] = {
+            "enabled": bool(enabled),
+            "expires_minutes": max(1, int(expires_minutes)),
+        }
+        cfg_save(cfg)
+        # 首次启用验证时，把已存在的老用户全部视为已验证（功能只针对新用户）。
+        if bool(enabled) and app_meta_get("verification_backfilled") != "1":
+            with closing(db()) as conn:
+                cur = conn.execute("UPDATE users SET verified=1 WHERE verified=0")
+                conn.commit()
+            app_meta_set("verification_backfilled", "1")
+            logger.info("verification enabled: backfilled %d existing users as verified", cur.rowcount)
+        return RedirectResponse("/rules", status_code=303)
+
+    @app.post("/rules/auto-reply")
+    async def rules_auto_reply_save(_: str = Depends(panel_auth), enabled: str | None = Form(None), text: str = Form(""), min_interval_minutes: int = Form(30)) -> RedirectResponse:
+        cfg = cfg_load_fresh()
+        bot_cfg = cfg.setdefault("bot", {})
+        bot_cfg["auto_reply"] = {
+            "enabled": bool(enabled),
+            "text": text.strip(),
+            "min_interval_minutes": max(5, int(min_interval_minutes)),
         }
         cfg_save(cfg)
         return RedirectResponse("/rules", status_code=303)

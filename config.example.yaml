@@ -1,81 +1,19 @@
-http:
-  timeout_seconds: 20
-  user_agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko)
-    Chrome/124.0 Safari/537.36 tg-watchbot/1.0
+# tg-watchbot 配置示例（人机验证 + 自动回复相关段）
+
 bot:
   rate_limit:
     window_seconds: 10
     max_messages: 3
   spam_filter:
+    enabled: true
+    auto_block: true        # 命中后静默拉黑：不转发、不通知管理员
+    keywords: []
+  # 新用户首条私聊先过图片验证码（PIL 本地生成，无外部依赖）
+  verification:
+    enabled: true           # 总开关；关闭后所有人直接转交
+    expires_minutes: 10     # 验证码有效期（分钟），超时点「换一张」重发
+  # 自动回复：启用后对私聊用户自动答复（忙碌/睡觉场景）
+  auto_reply:
     enabled: false
-    auto_block: true
-    keywords:
-    - 投资
-    - 博彩
-    - 空投
-  quick_replies:
-  - title: 已收到
-    text: 你好，消息已收到，我稍后处理。
-monitors:
-- name: NodeSeek 新帖
-  type: rss
-  url: https://rss.nodeseek.com/
-  interval_seconds: 30
-  keywords:
-  - VPS
-  - 优惠
-  - 免费
-  exclude_keywords: []
-  authors: []
-  categories: []
-  notify_on:
-    keyword_match: true
-    new_item: true
-    price_change: false
-    stock_change: false
-  notify_telegram: true
-  forum: true
-- name: Linux.do 最新
-  type: rss
-  url: https://linux.do/latest.rss
-  interval_seconds: 30
-  keywords:
-  - API
-  - 教程
-  - 开源
-  exclude_keywords: []
-  authors: []
-  categories: []
-  notify_on:
-    keyword_match: true
-    new_item: true
-    price_change: false
-    stock_change: false
-  notify_telegram: true
-  forum: true
-group_monitors:
-- name: TG 群关键词监听示例
-  enabled: false
-  listen_source: bot
-  chat_id: -1001234567890
-  keywords:
-  - VPS
-  - 优惠
-  exclude_keywords:
-  - 求带
-  notify_telegram: true
-  summary_mode: template
-  ai_base_url: ''
-  ai_api_key: ''
-  ai_model: gpt-4o-mini
-  ai_interface: responses
-  ai_temperature: 0.2
-  ai_timeout_seconds: 30
-  ai_prompt: ''
-  ai_min_interval_seconds: 30
-  ai_dedupe_window_seconds: 300
-cleanup:
-  enabled: true
-  interval_minutes: 60
-  monitor_message_delete_after_minutes: 60
-  monitor_retention_minutes: 1440
+    text: "消息已转发给管理员，佬友目前在睡觉，睡醒后会回复。"
+    min_interval_minutes: 30  # 同一用户两次自动回复的最小间隔（分钟，最小 5）

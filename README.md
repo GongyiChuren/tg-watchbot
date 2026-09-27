@@ -30,6 +30,12 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 ``` 
 ## 更新日志
 
+### 2026-09-27 更新
+
+- **自动构建镜像**：新增 GitHub Actions 工作流，推送到 `main` 或打 `v*` tag 时自动构建 `linux/amd64` + `linux/arm64` 双架构镜像并推送到 GHCR，无需自己 build，直接拉镜像就能跑（见「Docker 安装」）。
+- **CI 三层校验**：提交先跑离线端到端测试，测试不过不构建；构建后拉回镜像实跑一次 `/health` 冒烟测试，避免推出起不来的镜像。
+- README 同步更新。
+
 ### 2026-09-21 更新
 
 - **图片验证码人机验证**：新用户首次私聊 Bot 需先通过 4 位图片验证码（PIL 本地生成，无新增依赖），通过后消息才会转交管理员，支持「换一张」按钮和 10 分钟过期（可配置）。
@@ -190,6 +196,30 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 
 <a id="docker-install"></a>
 ## Docker 安装（含自启）
+
+**方式一：直接拉预构建镜像（推荐，不用本地 build）**
+
+推送到 `main` 后会自动构建 `linux/amd64` + `linux/arm64` 双架构镜像并发布到 GHCR：
+
+```bash
+git clone https://github.com/GongyiChuren/tg-watchbot.git tg-watchbot
+cd tg-watchbot
+cp .env.example .env
+cp config.example.yaml config.yaml
+chmod 600 .env
+touch tg-watchbot.sqlite3 tg-watchbot.log
+# 若 GHCR 包为私有，需要先登录（用 GitHub PAT，勾选 read:packages）
+# echo YOUR_GITHUB_PAT | docker login ghcr.io -u YOUR_GITHUB_USER --password-stdin
+docker compose -f docker-compose.ghcr.yml up -d
+```
+
+镜像地址：
+
+```text
+ghcr.io/gongyichuren/tg-watchbot:latest
+```
+
+**方式二：本地构建**
 
 ```bash
 git clone https://github.com/GongyiChuren/tg-watchbot.git tg-watchbot

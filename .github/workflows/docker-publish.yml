@@ -1,0 +1,131 @@
+name: Publish Docker image
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # 离线端到端测试（不联网、不需要真 Token），失败则不出镜像
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run offline tests
+        run: python tests/test_captcha_flow.py
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tags: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ghcr 镜像名必须全小写，仓库名 GongyiChuren/tg-watchbot 含大写字母需要转换
+      - name: Compute lowercase image name
+        id: image
+        run: echo "name=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push (amd64 + arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # 拉回刚推送的镜像实跑一次，确保推出去的镜像真的能启动（app 启动需要 config.yaml）
+  smoke-test:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute lowercase image name
+        id: image
+        run: echo "name=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run container and hit /health
+        env:
+          REGISTRY: ghcr.io
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          TAGS: ${{ needs.build.outputs.tags }}
+        run: |
+          set -euo pipefail
+          IMAGE="$(echo "$TAGS" | head -n1)"
+          echo "测试镜像：$IMAGE"
+          docker pull "$IMAGE"
+          docker run -d --name smoke \
+            -v "$PWD/config.example.yaml:/app/config.yaml:ro" \
+            -e WEB_PANEL_ENABLED=true \
+            -e WEB_PANEL_HOST=0.0.0.0 \
+            -e WEB_PANEL_PORT=8765 \
+            -e WEB_PANEL_USER=admin \
+            -e WEB_PANEL_PASSWORD=ci-smoke-test \
+            -p 8765:8765 "$IMAGE"
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8765/health; then
+              echo "health OK（第 $i 次探测）"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "健康检查失败，容器日志："
+          docker logs smoke
+          exit 1

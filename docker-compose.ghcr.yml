@@ -1,0 +1,16 @@
+services:
+  tg-watchbot:
+    # 预构建镜像：推送到 main 后由 GitHub Actions 自动构建并发布（amd64 + arm64）
+    # 手动指定版本：IMAGE_TAG=v2026.09.27 docker compose -f docker-compose.ghcr.yml up -d
+    image: ghcr.io/gongyichuren/tg-watchbot:${IMAGE_TAG:-latest}
+    container_name: tg-watchbot
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8765:8765"
+    environment:
+      WEB_PANEL_HOST: "0.0.0.0"
+    volumes:
+      - ./.env:/app/.env
+      - ./config.yaml:/app/config.yaml
+      - ./tg-watchbot.sqlite3:/app/tg-watchbot.sqlite3
+      - ./tg-watchbot.log:/app/tg-watchbot.log

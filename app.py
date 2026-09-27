@@ -3236,7 +3236,7 @@ html[data-theme='dark'] pre{{background:#09090b;border-color:rgba(255,255,255,.0
 @media (prefers-reduced-motion: reduce){{
   *,*::before,*::after{{animation:none!important;transition:none!important}}
 }}
-</style></head><body><div class=shell><aside><div class=brand><div class=mark><i></i></div><div><b>tg-watchbot</b><small>Telegram 自动化</small></div></div><nav><section><b>常用</b><a href='/'>总览</a><a href='/inbox'>收件箱</a><a href='/users'>用户</a><a href='/send'>发消息</a></section><section><b>转发</b><a href='/group-monitors'>群监听</a><a href='/monitor/events'>历史</a></section><section><b>设置</b><a href='/settings'>面板设置</a><a href='/yaml'>YAML</a><a href='/config/export'>导入导出</a></section><section><b>系统</b><a href='/update'>更新</a><a href='/logs'>日志</a><a href='/restart' onclick='return confirm("确定重启机器人服务？")'>重启</a><a class=logout href='/logout'>退出</a></section></nav></aside><main><div class=top><h1>{html_escape(title)}</h1><div class=top-actions><button class='btn theme-toggle' type=button data-theme-toggle onclick='toggleTheme()' aria-label='切换暗黑主题' title='切换暗黑主题'>暗</button><span class=badge>WatchBot Panel</span></div></div>
+</style></head><body><div class=shell><aside><div class=brand><div class=mark><i></i></div><div><b>tg-watchbot</b><small>Telegram 自动化</small></div></div><nav><section><b>常用</b><a href='/'>总览</a><a href='/inbox'>收件箱</a><a href='/users'>用户</a><a href='/send'>发消息</a><a href='/rules'>拦截规则</a><a href='/auto-reply'>自动回复</a></section><section><b>转发</b><a href='/group-monitors'>群监听</a><a href='/monitor/events'>历史</a></section><section><b>设置</b><a href='/settings'>面板设置</a><a href='/yaml'>YAML</a><a href='/config/export'>导入导出</a></section><section><b>系统</b><a href='/update'>更新</a><a href='/logs'>日志</a><a href='/restart' onclick='return confirm("确定重启机器人服务？")'>重启</a><a class=logout href='/logout'>退出</a></section></nav></aside><main><div class=top><h1>{html_escape(title)}</h1><div class=top-actions><button class='btn theme-toggle' type=button data-theme-toggle onclick='toggleTheme()' aria-label='切换暗黑主题' title='切换暗黑主题'>暗</button><span class=badge>WatchBot Panel</span></div></div>
 {body}<div class=friend-links><b>友链</b><a href='https://linux.do' target='_blank' rel='noopener noreferrer'>Linux.do</a><span>·</span><a href='https://www.nodeseek.com' target='_blank' rel='noopener noreferrer'>NodeSeek</a></div></main></div>{theme_interaction_script()}</body></html>"""
 
 
@@ -4085,21 +4085,26 @@ async function logoutTgSession() {{
         spam = (cfg.get("bot") or {}).get("spam_filter") or {}
         keywords = "\n".join(spam.get("keywords") or [])
         vf = (cfg.get("bot") or {}).get("verification") or {}
-        ar = (cfg.get("bot") or {}).get("auto_reply") or {}
         body = f"""<div class=card><h2>私聊广告拦截</h2><p class=muted>只拦截用户私聊 Bot 的双向对话消息，不影响 RSS/Web 监控关键词。监控内容过滤请使用监控配置里的屏蔽词。命中且开启自动拉黑时：静默拉黑，不转发、不通知管理员。</p><form method=post>
 <div class=check-row><label><input type=checkbox name=enabled {'checked' if spam.get('enabled') else ''}> 启用</label><label><input type=checkbox name=auto_block {'checked' if spam.get('auto_block', True) else ''}> 命中后自动拉黑</label></div>
 <label>广告关键词（一行一个）</label><textarea name=keywords>{html_escape(keywords)}</textarea>
 <div class=form-actions><button class='btn primary' type=submit>保存规则</button></div></form></div>
-<div class=card><h2>人机验证</h2><p class=muted>新用户第一次私聊 Bot 需要先回复图片验证码才能转发消息；已验证用户长期有效。人工命令：/verify /unverify /verifylist。</p><form method=post action='/rules/verification'>
+<div class=card><h2>人机验证</h2><p class=muted>新用户第一次私聊 Bot 需要先回复图片验证码才能转发消息；答错一次验证码立即作废并自动换新图，验证阶段同样受限流保护。已验证用户长期有效。人工命令：/verify /unverify /verifylist。</p><form method=post action='/rules/verification'>
 <div class=check-row><label><input type=checkbox name=enabled {'checked' if vf.get('enabled') else ''}> 启用人机验证</label></div>
 <label>验证码有效期（分钟）</label><input name=expires_minutes value='{html_escape(vf.get('expires_minutes', 10))}'></p>
-<div class=form-actions><button class='btn primary' type=submit>保存验证设置</button></div></form></div>
-<div class=card><h2>自动回复</h2><p class=muted>用户私聊发来消息时自动答复（例如「已转发，佬友我在睡觉，睡醒回复」）。同一用户按间隔去重，不会每条消息都回。</p><form method=post action='/rules/auto-reply'>
+<div class=form-actions><button class='btn primary' type=submit>保存验证设置</button></div></form></div>"""
+        return layout("拦截规则", body)
+
+    @app.get("/auto-reply", response_class=HTMLResponse)
+    async def auto_reply_page(_: str = Depends(panel_auth)) -> str:
+        cfg = cfg_load_fresh()
+        ar = (cfg.get("bot") or {}).get("auto_reply") or {}
+        body = f"""<div class=card><h2>私聊自动回复</h2><p class=muted>用户私聊发来消息时自动答复（例如「已转发，佬友我在睡觉，睡醒回复」）。仅对已通过验证的正常用户生效；同一用户按间隔去重，不会每条消息都回。保存后立即生效，无需重启。</p><form method=post action='/auto-reply'>
 <div class=check-row><label><input type=checkbox name=enabled {'checked' if ar.get('enabled') else ''}> 启用自动回复</label></div>
 <label>回复内容</label><textarea name=text>{html_escape(ar.get('text') or '')}</textarea>
 <label>同一用户最小间隔（分钟，最小 5）</label><input name=min_interval_minutes value='{html_escape(ar.get('min_interval_minutes', 30))}'>
 <div class=form-actions><button class='btn primary' type=submit>保存自动回复</button></div></form></div>"""
-        return layout("拦截规则", body)
+        return layout("自动回复", body)
 
     @app.post("/rules")
     async def rules_save(_: str = Depends(panel_auth), enabled: str | None = Form(None), auto_block: str | None = Form(None), keywords: str = Form("")) -> RedirectResponse:
@@ -4131,8 +4136,8 @@ async function logoutTgSession() {{
             logger.info("verification enabled: backfilled %d existing users as verified", cur.rowcount)
         return RedirectResponse("/rules", status_code=303)
 
-    @app.post("/rules/auto-reply")
-    async def rules_auto_reply_save(_: str = Depends(panel_auth), enabled: str | None = Form(None), text: str = Form(""), min_interval_minutes: int = Form(30)) -> RedirectResponse:
+    @app.post("/auto-reply")
+    async def auto_reply_save(_: str = Depends(panel_auth), enabled: str | None = Form(None), text: str = Form(""), min_interval_minutes: int = Form(30)) -> RedirectResponse:
         cfg = cfg_load_fresh()
         bot_cfg = cfg.setdefault("bot", {})
         bot_cfg["auto_reply"] = {
@@ -4141,7 +4146,7 @@ async function logoutTgSession() {{
             "min_interval_minutes": max(5, int(min_interval_minutes)),
         }
         cfg_save(cfg)
-        return RedirectResponse("/rules", status_code=303)
+        return RedirectResponse("/auto-reply", status_code=303)
 
     @app.get("/replies", response_class=HTMLResponse)
     async def replies_page(_: str = Depends(panel_auth)) -> str:

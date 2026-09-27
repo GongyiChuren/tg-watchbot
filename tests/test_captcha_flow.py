@@ -9,12 +9,19 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import app  # noqa: E402
+
+# 测试使用独立的临时数据库和日志文件，不碰仓库目录里的 tg-watchbot.sqlite3。
+# 否则在非 root 用户下运行会直接报 "attempt to write a readonly database"。
+_TEMP_DIR = tempfile.TemporaryDirectory()
+app.DB_PATH = Path(_TEMP_DIR.name) / "test.sqlite3"
+app.LOG_PATH = Path(_TEMP_DIR.name) / "test.log"
 
 
 class FakeBot:

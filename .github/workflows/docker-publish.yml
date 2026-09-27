@@ -24,7 +24,11 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
       - name: Run offline tests
-        run: python tests/test_captcha_flow.py
+        run: |
+          python tests/test_captcha_flow.py
+          python tests/test_monitor_message_cleanup.py
+          python tests/test_env_priority.py
+          python tests/test_env_save_reload.py
 
   build:
     needs: test

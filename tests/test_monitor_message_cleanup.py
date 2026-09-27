@@ -8,6 +8,9 @@ from contextlib import closing
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+# 让 `import app` 能找到仓库根目录下的 app.py（直接运行本文件时 cwd 不一定是仓库根）
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 
 def install_import_stubs() -> None:
     class DummyRouter:
@@ -16,6 +19,25 @@ def install_import_stubs() -> None:
                 return func
 
             return decorator
+
+        def callback_query(self, *args, **kwargs):
+            def decorator(func):
+                return func
+
+            return decorator
+
+    class DummyF:
+        """`from aiogram import F` 在模块级被用于 `F.data == "..."` 过滤器表达式，
+        必须是可任意取属性的对象。"""
+
+        def __getattr__(self, item):
+            return self
+
+        def __eq__(self, other):
+            return self
+
+        def __hash__(self):
+            return id(self)
 
     def identity_factory(*args, **kwargs):
         return object()
@@ -48,13 +70,20 @@ def install_import_stubs() -> None:
     modules["yaml"].safe_dump = lambda data, **kwargs: str(data)
     modules["aiogram"].Bot = object
     modules["aiogram"].Dispatcher = object
-    modules["aiogram"].F = object()
+    modules["aiogram"].F = DummyF()
     modules["aiogram"].Router = DummyRouter
     modules["aiogram.enums"].ParseMode = SimpleNamespace(HTML="HTML")
     modules["aiogram.exceptions"].TelegramAPIError = Exception
     modules["aiogram.filters"].Command = identity_factory
     modules["aiogram.filters"].CommandObject = object
-    modules["aiogram.types"].Message = object
+    for name in (
+        "BufferedInputFile",
+        "CallbackQuery",
+        "InlineKeyboardButton",
+        "InlineKeyboardMarkup",
+        "Message",
+    ):
+        setattr(modules["aiogram.types"], name, object)
     modules["aiogram.client.default"].DefaultBotProperties = identity_factory
     modules["fastapi"].Depends = identity_factory
     modules["fastapi"].FastAPI = object

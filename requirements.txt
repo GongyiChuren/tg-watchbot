@@ -3,7 +3,7 @@ APScheduler==3.11.1
 beautifulsoup4==4.14.3
 fastapi==0.136.1
 feedparser==6.0.12
-httpx==0.28.1
+httpx[http2]==0.28.1
 python-dotenv==1.2.1
 python-multipart==0.0.20
 PyYAML==6.0.3

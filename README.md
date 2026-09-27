@@ -32,8 +32,11 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 
 ### 2026-09-27 更新
 
+- **修复 Docker 下面板访问不了**：`.env` 里的 `WEB_PANEL_HOST` 原本会顶掉 Docker Compose 注入的 `0.0.0.0`，导致容器内面板只绑 `127.0.0.1`、宿主机打不开。现在真实环境变量（Docker/systemd 注入）优先，`.env` 只补充未设置的项。
+- **修复 Linux.do 监控长期失效**：linux.do 的 Cloudflare 只放行 HTTP/2，用 HTTP/1.1 抓取会一直返回 403 挑战页。现在自动启用 HTTP/2（依赖 `httpx[http2]`），实测恢复正常抓取；遇到同类挑战页时日志会给出明确提示而不是一句没头绪的 403。
 - **自动构建镜像**：新增 GitHub Actions 工作流，推送到 `main` 或打 `v*` tag 时自动构建 `linux/amd64` + `linux/arm64` 双架构镜像并推送到 GHCR，无需自己 build，直接拉镜像就能跑（见「Docker 安装」）。
 - **CI 三层校验**：提交先跑离线端到端测试，测试不过不构建；构建后拉回镜像实跑一次 `/health` 冒烟测试，避免推出起不来的镜像。
+- 测试修复：两个离线测试现在都能直接跑通（此前分别因权限、缺 stub 而报错）。
 - README 同步更新。
 
 ### 2026-09-21 更新
@@ -234,7 +237,7 @@ docker compose up -d --build
 Docker 容器内会监听 `0.0.0.0:8765`，但 `docker-compose.yml` 默认只把端口绑定到宿主机 `127.0.0.1:8765`。宿主机打开 `http://127.0.0.1:8765` 即可访问面板。
 
 **⚠️ 注意事项：**
-- `.env.example` 里的 `WEB_PANEL_HOST` 默认为 `127.0.0.1`；Docker Compose 会覆盖为容器内可访问的 `0.0.0.0`。
+- 容器内的面板监听地址由 Docker Compose 的 `WEB_PANEL_HOST=0.0.0.0` 决定；`.env` 里同名的值不会顶掉它（真实环境变量优先）。若你确实想改容器内监听地址，改 `docker-compose.yml` 的 `environment`。
 - 不建议直接把 `8765` 裸露到公网；如需公网访问，优先使用 Cloudflare Tunnel、Nginx/Caddy 反代鉴权或 SSH 隧道。
 - `.env` 文件会被容器挂载并写入（如 session secret），请勿设置为只读（`:ro`）。
 - 如果你明确要直接公网访问，需要同时修改 `docker-compose.yml` 端口映射、服务器防火墙/安全组，并在面板里改强密码。

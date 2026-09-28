@@ -2365,7 +2365,24 @@ def extract_price(text: str) -> str | None:
 
 def keyword_hits(text: str, keywords: list[str]) -> list[str]:
     low = text.lower()
-    return [k for k in keywords if k and k.lower() in low]
+
+    def compact(value: str) -> str:
+        # Ignore spacing and punctuation inside an ALL group so variants such
+        # as "US.LA" and "US LA" match the same model/route token.
+        return re.sub(r"[^\w\u3400-\u9fff]+", "", value.lower(), flags=re.UNICODE)
+
+    compact_text = compact(text)
+    hits: list[str] = []
+    for keyword in keywords:
+        if not keyword:
+            continue
+        if keyword.startswith("ALL:"):
+            parts = [part.strip() for part in keyword[4:].split("|") if part.strip()]
+            if parts and all(compact(part) in compact_text for part in parts):
+                hits.append(" + ".join(parts))
+        elif keyword.lower() in low:
+            hits.append(keyword)
+    return hits
 
 
 def item_blocked(item: MonitorItem, monitor: dict[str, Any]) -> tuple[bool, str]:
